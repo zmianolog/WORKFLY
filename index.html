@@ -1,0 +1,2870 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WORKFLY — makieta v6</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>html,body{margin:0;padding:0;}</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useRef, useLayoutEffect, useEffect } = React;
+
+// ===== MAGAZYN (wspólna baza w localStorage) =====
+// ============================================================
+// WORKFLY v6 — MAGAZYN (wspólna warstwa danych, localStorage)
+// Jedna baza dla wszystkich modułów: procesy (rodziny wersji),
+// zlecenia, tikety, ad hoc, stanowiska. Autozapis, eksport/import.
+// Silnik: generowanie tiketów, aktywacja, decyzje XOR, odhacz NT.
+// OGRANICZENIE: baza żyje w JEDNEJ przeglądarce (localStorage).
+// PĘTLE: domknięcie kroku-źródła pętli tworzy tiket decyzyjny
+// "powtórzyć / dalej". "Powtórz" klonuje tikety ciała pętli jako
+// iterację n+1 (numer ·2, ·3...). Limit ogranicza liczbę powtórzeń.
+// ============================================================
+
+const MAGAZYN_KLUCZ = 'workfly_baza_v6';
+
+const MAGAZYN_PUSTY = () => ({
+  wersjaSchematu: 6,
+  procesy: [],     // {id, rodzinaId, wersja, nazwa, status: szkic|opublikowany|wycofany|archiwum, kroki:[], przejscia:[], utworzono, opublikowano}
+  zlecenia: [],    // {id, nr, procesId, klient, dataStart, priorytet, wartosc, pm, status: w_toku|zakonczone, utworzono}
+  tikety: [],      // {id, zlecenieId, krokId, nazwa, numer, stanowisko, osoba, widoczny, wymagaDowodu, dowodDolaczony, sla, slaJedn, typ: zadanie|decyzja, stan: oczekujacy|warunkowy|aktywny|anulowany, statusPracy: do|trakcie|zrobione, deadline, dokZadania:[], dokZlecenia:[], galaz, bramkaId}
+  decyzjeXor: [],  // {zlecenieId, bramkaKrokId, wybranePrzejscieId, kiedy}
+  adhoc: [],       // tikety ad hoc (jak w module pracownika)
+  stanowiska: ['Serwisant', 'Koordynator', 'COO', 'Klient'],
+  licznikZlecen: 17,
+});
+
+let _cache = null;
+const _subs = new Set();
+
+function bazaWczytaj() {
+  if (_cache) return _cache;
+  try {
+    const raw = window.localStorage.getItem(MAGAZYN_KLUCZ);
+    _cache = raw ? JSON.parse(raw) : MAGAZYN_PUSTY();
+  } catch (e) { _cache = MAGAZYN_PUSTY(); }
+  return _cache;
+}
+function bazaZapisz() {
+  // świeża referencja po każdej zmianie — inaczej useMemo([baza]) w modułach
+  // nie przeliczy się (mutacja w miejscu = ta sama referencja). Dane są małe,
+  // głęboka kopia jest tania i gwarantuje spójny re-render wszędzie.
+  _cache = JSON.parse(JSON.stringify(_cache));
+  try { window.localStorage.setItem(MAGAZYN_KLUCZ, JSON.stringify(_cache)); } catch (e) {}
+  _subs.forEach(fn => { try { fn(); } catch (e) {} });
+}
+function bazaSubskrybuj(fn) { _subs.add(fn); return () => _subs.delete(fn); }
+function bazaMutuj(fn) { const b = bazaWczytaj(); fn(b); bazaZapisz(); return b; }
+function uidB() { return 'id_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36); }
+
+// ---------- PROCESY: rodzina wersji ----------
+function procesyLista() {
+  const b = bazaWczytaj();
+  return b.procesy.slice().sort((a, c) => (a.nazwa || '').localeCompare(c.nazwa || '') || a.wersja - c.wersja);
+}
+function procesZapiszSzkic(proc) {
+  // autozapis szkicu: nadpisuje rekord o tym samym id (szkic wolno nadpisywać)
+  bazaMutuj(b => {
+    const i = b.procesy.findIndex(p => p.id === proc.id);
+    if (i >= 0) b.procesy[i] = proc; else b.procesy.push(proc);
+  });
+}
+function procesNowy(nazwa) {
+  const id = uidB();
+  const proc = { id, rodzinaId: id, wersja: 1, nazwa: nazwa || 'Nowy proces', status: 'szkic', kroki: [], przejscia: [], utworzono: new Date().toISOString() };
+  bazaMutuj(b => b.procesy.push(proc));
+  return proc;
+}
+function procesOpublikuj(procId) {
+  bazaMutuj(b => {
+    const p = b.procesy.find(x => x.id === procId);
+    if (!p) return;
+    // poprzednia opublikowana w rodzinie -> wycofana
+    b.procesy.filter(x => x.rodzinaId === p.rodzinaId && x.status === 'opublikowany' && x.id !== p.id)
+      .forEach(x => { x.status = 'wycofany'; });
+    p.status = 'opublikowany';
+    p.opublikowano = new Date().toISOString();
+  });
+}
+function procesNowaWersja(procId) {
+  // edycja opublikowanego = szkic n+1 (kopia struktury); zwraca nowy szkic
+  const b = bazaWczytaj();
+  const stary = b.procesy.find(p => p.id === procId);
+  if (!stary) return null;
+  const maxW = Math.max(...b.procesy.filter(p => p.rodzinaId === stary.rodzinaId).map(p => p.wersja));
+  const nowy = JSON.parse(JSON.stringify(stary));
+  nowy.id = uidB(); nowy.wersja = maxW + 1; nowy.status = 'szkic';
+  nowy.utworzono = new Date().toISOString(); delete nowy.opublikowano;
+  bazaMutuj(bb => bb.procesy.push(nowy));
+  return nowy;
+}
+function procesUsunZArchiwum(procId) {
+  bazaMutuj(b => { b.procesy = b.procesy.filter(p => !(p.id === procId && p.status === 'archiwum')); });
+}
+function procesSzkicUsun(procId) {
+  bazaMutuj(b => { b.procesy = b.procesy.filter(p => !(p.id === procId && p.status === 'szkic')); });
+}
+function sprawdzArchiwizacje() {
+  // wycofana wersja bez żadnego niezakończonego zlecenia -> archiwum (spec 7.1)
+  bazaMutuj(b => {
+    b.procesy.filter(p => p.status === 'wycofany').forEach(p => {
+      const zywe = b.zlecenia.some(z => z.procesId === p.id && z.status !== 'zakonczone');
+      if (!zywe) p.status = 'archiwum';
+    });
+  });
+}
+
+// ---------- SILNIK: generowanie i aktywacja tiketów ----------
+function _nastepniki(proc, krokId) { return proc.przejscia.filter(p => p.zrodlo === krokId && !p.petla); }
+function _petlaZ(proc, krokId) { return proc.przejscia.find(p => p.petla && p.zrodlo === krokId); }
+function _cialoPetli(proc, petlaP) {
+  // kroki od celu pętli do jej źródła włącznie (BFS w przód, bez krawędzi petla)
+  const cialo = new Set(); const kolejka = [petlaP.cel];
+  while (kolejka.length) {
+    const kid = kolejka.shift();
+    if (cialo.has(kid)) continue;
+    cialo.add(kid);
+    if (kid === petlaP.zrodlo) continue; // źródło zamyka ciało
+    proc.przejscia.filter(p => p.zrodlo === kid && !p.petla).forEach(p => kolejka.push(p.cel));
+  }
+  return cialo;
+}
+function _poprzedniki(proc, krokId) { return proc.przejscia.filter(p => p.cel === krokId && !p.petla); }
+
+function generujTikety(proc, zlecenie) {
+  // tiket z KAŻDEGO kroku-zadania/końca (v6); bramki -> tikety decyzyjne tworzone w locie
+  const tikety = [];
+  const numeracja = {}; // policz prostą numerację jak w modelowaniu
+  let lic = 0;
+  proc.kroki.forEach(k => {
+    const wejB = proc.przejscia.find(p => p.cel === k.id && p.bramka);
+    if (wejB) {
+      const rodz = proc.przejscia.filter(p => p.zrodlo === wejB.zrodlo);
+      const idx = rodz.findIndex(p => p.cel === k.id);
+      numeracja[k.id] = (numeracja[wejB.zrodlo] || '?') + String.fromCharCode(97 + Math.max(0, idx));
+    } else { lic++; numeracja[k.id] = String(lic); }
+  });
+  proc.kroki.filter(k => k.typ === 'zadanie' || k.typ === 'koniec').forEach(k => {
+    const zaXor = proc.przejscia.some(p => p.cel === k.id && p.bramka === 'XOR');
+    tikety.push({
+      id: uidB(), zlecenieId: zlecenie.id, krokId: k.id, typ: 'zadanie',
+      nazwa: k.nazwa, numer: numeracja[k.id] || '?',
+      stanowisko: k.stanowisko || 'Nieprzypisane', osoba: zlecenie.przypisania?.[k.stanowisko] || null,
+      widoczny: k.tiketowy !== false, wymagaDowodu: !!k.wymagaZdjecia, dowodDolaczony: false,
+      sla: k.sla || '', slaJedn: k.slaJedn || 'dni',
+      dokZadania: (k.linki || []).map(l => ({ nazwa: l.nazwa, url: l.url || '#' })),
+      dokZlecenia: zlecenie.dokTiketu?.[numeracja[k.id]] || [],
+      stan: zaXor ? 'warunkowy' : 'oczekujacy', statusPracy: 'do', iteracja: 1,
+      deadline: null, zlecenieNr: zlecenie.nr, klient: zlecenie.klient,
+    });
+  });
+  return tikety;
+}
+
+function przeliczAktywacje(zlecenieId) {
+  // rdzeń silnika: aktywuj tikety, których poprzedniki są spełnione;
+  // twórz tikety decyzyjne przy XOR; zejście 'wszystkie' czeka na komplet.
+  bazaMutuj(b => {
+    const z = b.zlecenia.find(x => x.id === zlecenieId); if (!z) return;
+    const proc = b.procesy.find(p => p.id === z.procesId); if (!proc) return;
+    const tk = b.tikety.filter(t => t.zlecenieId === zlecenieId);
+    // najnowsza iteracja per krok (pętle tworzą kolejne tikety tego samego kroku)
+    const tikPoKroku = {};
+    tk.forEach(t => {
+      if (t.typ !== 'zadanie') return;
+      const ex = tikPoKroku[t.krokId];
+      if (!ex || (t.iteracja || 1) > (ex.iteracja || 1)) tikPoKroku[t.krokId] = t;
+    });
+    const zrobiony = kid => { const t = tikPoKroku[kid]; return t && t.statusPracy === 'zrobione' && t.stan !== 'anulowany'; };
+    const iterKroku = kid => (tikPoKroku[kid] && tikPoKroku[kid].iteracja) || 1;
+    const liczbaPowtorzen = pid => b.decyzjeXor.filter(d => d.zlecenieId === zlecenieId && d.wybranePrzejscieId === pid).length;
+    // krok-źródło pętli "przepuszcza" przepływ dalej dopiero po decyzji "dalej"
+    // (albo gdy limit powtórzeń wyczerpany — wtedy automatycznie dalej)
+    const przepuszcza = kid => {
+      if (!zrobiony(kid)) return false;
+      const pet = _petlaZ(proc, kid);
+      if (!pet) return true;
+      if (pet.limit && liczbaPowtorzen(pet.id) >= pet.limit) return true;
+      return b.decyzjeXor.some(d => d.zlecenieId === zlecenieId && d.bramkaKrokId === kid && d.wybranePrzejscieId === '__dalej__' && (d.iteracja || 1) === iterKroku(kid));
+    };
+
+    function krokSpelniony(kid) {
+      // czy "wyjście" z tego węzła może aktywować następnik
+      const krok = proc.kroki.find(k => k.id === kid);
+      if (!krok) return false;
+      if (krok.typ === 'zadanie' || krok.typ === 'koniec') return przepuszcza(kid);
+      if (krok.typ === 'bramka') {
+        // bramka spełniona, gdy jej poprzednik spełniony ORAZ (XOR: jest decyzja)
+        const wej = _poprzedniki(proc, kid);
+        const wejOk = wej.length === 0 || wej.every(p => krokSpelniony(p.zrodlo));
+        if (!wejOk) return false;
+        if (krok.podtyp === 'XOR') {
+          const iterBramki = Math.max(1, ...wej.map(p => iterKroku(p.zrodlo)));
+          return b.decyzjeXor.some(d => d.zlecenieId === zlecenieId && d.bramkaKrokId === kid && (d.iteracja || 1) === iterBramki);
+        }
+        return true; // AND: spełniona od razu po wejściu
+      }
+      return false;
+    }
+
+    tk.filter(t => t.typ === 'zadanie' && (t.stan === 'oczekujacy' || t.stan === 'warunkowy') && t === tikPoKroku[t.krokId]).forEach(t => {
+      const wej = _poprzedniki(proc, t.krokId);
+      if (wej.length === 0) { t.stan = 'aktywny'; return; } // pierwszy krok
+      const krok = proc.kroki.find(k => k.id === t.krokId);
+      const trybZejscia = wej.length > 1 ? (krok?.trybZejscia || 'wszystkie') : 'wszystkie';
+      const sprawdzWejscie = (p) => {
+        const zrodloKrok = proc.kroki.find(k => k.id === p.zrodlo);
+        if (zrodloKrok?.typ === 'bramka' && zrodloKrok.podtyp === 'XOR') {
+          // aktywuj tylko wybraną gałąź
+          const decs = b.decyzjeXor.filter(d => d.zlecenieId === zlecenieId && d.bramkaKrokId === p.zrodlo);
+          const dec = decs.length ? decs[decs.length - 1] : null;
+          return !!dec && dec.wybranePrzejscieId === p.id && krokSpelniony(p.zrodlo);
+        }
+        return krokSpelniony(p.zrodlo);
+      };
+      const ok = trybZejscia === 'pierwsza' ? wej.some(sprawdzWejscie) : wej.every(sprawdzWejscie);
+      if (ok) t.stan = 'aktywny';
+    });
+
+    // tikety decyzyjne XOR: bramka z wejściem spełnionym i bez decyzji -> tiket 'decyzja' (jeśli nie istnieje)
+    proc.kroki.filter(k => k.typ === 'bramka' && k.podtyp === 'XOR').forEach(br => {
+      const wej = _poprzedniki(proc, br.id);
+      const wejOk = wej.length === 0 || wej.every(p => krokSpelniony(p.zrodlo));
+      const iterBramki = Math.max(1, ...(_poprzedniki(proc, br.id).map(p => iterKroku(p.zrodlo))), 1);
+      const maDecyzje = b.decyzjeXor.some(d => d.zlecenieId === zlecenieId && d.bramkaKrokId === br.id && (d.iteracja || 1) === iterBramki);
+      const istnieje = b.tikety.some(t => t.zlecenieId === zlecenieId && t.typ === 'decyzja' && t.krokId === br.id && (t.iteracja || 1) === iterBramki);
+      if (wejOk && !maDecyzje && !istnieje) {
+        b.tikety.push({ id: uidB(), zlecenieId, krokId: br.id, typ: 'decyzja', nazwa: br.nazwa || 'Decyzja',
+          numer: '', stanowisko: '—', widoczny: false, stan: 'aktywny', statusPracy: 'do', iteracja: iterBramki,
+          galezie: _nastepniki(proc, br.id).map(p => ({ przejscieId: p.id, etykieta: p.etykieta || 'ścieżka' })),
+          zlecenieNr: z.nr, klient: z.klient });
+      }
+    });
+
+    // tikety decyzyjne PĘTLI: krok-źródło zrobiony, limit niewyczerpany, brak decyzji w tej iteracji
+    proc.przejscia.filter(p => p.petla).forEach(pet => {
+      const kid = pet.zrodlo;
+      if (!zrobiony(kid)) return;
+      if (pet.limit && liczbaPowtorzen(pet.id) >= pet.limit) return;
+      const iter = iterKroku(kid);
+      const maDec = b.decyzjeXor.some(d => d.zlecenieId === zlecenieId && d.bramkaKrokId === kid && (d.iteracja || 1) === iter);
+      const jest = b.tikety.some(t => t.zlecenieId === zlecenieId && t.typ === 'decyzja' && t.krokId === kid && (t.iteracja || 1) === iter);
+      if (maDec || jest) return;
+      const krokZrodlo = proc.kroki.find(k => k.id === kid);
+      const celKrok = proc.kroki.find(k => k.id === pet.cel);
+      b.tikety.push({ id: uidB(), zlecenieId, krokId: kid, typ: 'decyzja', podtyp: 'petla', iteracja: iter,
+        nazwa: 'Pętla: powtórzyć od „' + ((celKrok && celKrok.nazwa) || '?') + '"?' + (pet.limit ? ' (limit ' + pet.limit + '×)' : ''),
+        numer: '', stanowisko: '—', widoczny: false, stan: 'aktywny', statusPracy: 'do',
+        galezie: [ { przejscieId: pet.id, etykieta: '↩ powtórz' }, { przejscieId: '__dalej__', etykieta: 'dalej (bez powtórki)' } ],
+        zlecenieNr: z.nr, klient: z.klient });
+    });
+
+    // zakończenie zlecenia: dowolny krok 'koniec' na aktywnej ścieżce zrobiony
+    const konce = proc.kroki.filter(k => k.typ === 'koniec');
+    if (konce.length && konce.some(k => zrobiony(k.id))) z.status = 'zakonczone';
+  });
+  sprawdzArchiwizacje();
+}
+
+function uruchomZlecenie(proc, dane) {
+  const b = bazaWczytaj();
+  b.licznikZlecen = (b.licznikZlecen || 17) + 1;
+  const z = { id: uidB(), nr: `ZLEC-2026-${String(b.licznikZlecen).padStart(3, '0')}`,
+    procesId: proc.id, klient: dane.klient || '', dataStart: dane.dataStart || '',
+    priorytet: dane.priorytet || 'normalny', wartosc: dane.wartosc || '', pm: dane.pm || '',
+    przypisania: dane.przypisania || {}, dokTiketu: dane.dokTiketu || {},
+    status: 'w_toku', utworzono: new Date().toISOString() };
+  const tk = generujTikety(proc, z);
+  bazaMutuj(bb => { bb.zlecenia.push(z); bb.tikety.push(...tk); });
+  przeliczAktywacje(z.id);
+  return z;
+}
+
+function tiketUstaw(tiketId, zmiany) {
+  let zlecenieId = null;
+  bazaMutuj(b => { const t = b.tikety.find(x => x.id === tiketId); if (t) { Object.assign(t, zmiany); zlecenieId = t.zlecenieId; } });
+  if (zlecenieId && (zmiany.statusPracy || zmiany.stan)) przeliczAktywacje(zlecenieId);
+}
+function decyzjaXorPodejmij(zlecenieId, bramkaKrokId, przejscieId) {
+  bazaMutuj(b => {
+    const z = b.zlecenia.find(x => x.id === zlecenieId);
+    const proc = z && b.procesy.find(p => p.id === z.procesId);
+    // iteracja decyzji = iteracja otwartego tiketu decyzyjnego tej bramki/kroku
+    const decTik = b.tikety.filter(t => t.zlecenieId === zlecenieId && t.typ === 'decyzja' && t.krokId === bramkaKrokId && t.statusPracy !== 'zrobione').pop();
+    const iter = (decTik && decTik.iteracja) || 1;
+    b.decyzjeXor.push({ zlecenieId, bramkaKrokId, wybranePrzejscieId: przejscieId, iteracja: iter, kiedy: new Date().toISOString() });
+    if (decTik) decTik.statusPracy = 'zrobione';
+
+    // decyzja pętli "↩ powtórz": klonuj tikety ciała pętli jako iterację n+1
+    const pet = proc && proc.przejscia.find(p => p.id === przejscieId && p.petla);
+    if (pet) {
+      const cialo = _cialoPetli(proc, pet);
+      const nowaIter = iter + 1;
+      proc.kroki.filter(k => cialo.has(k.id) && (k.typ === 'zadanie' || k.typ === 'koniec')).forEach(k => {
+        const wzor = b.tikety.filter(t => t.zlecenieId === zlecenieId && t.typ === 'zadanie' && t.krokId === k.id).pop();
+        if (!wzor) return;
+        const kopia = JSON.parse(JSON.stringify(wzor));
+        kopia.id = uidB(); kopia.iteracja = nowaIter;
+        kopia.numer = String(wzor.numer).split('·')[0] + '·' + nowaIter;
+        kopia.statusPracy = 'do'; kopia.stan = 'oczekujacy';
+        kopia.dowodDolaczony = false; kopia.wykonano = null; delete kopia.powodAnulowania;
+        b.tikety.push(kopia);
+      });
+    }
+  });
+  przeliczAktywacje(zlecenieId);
+}
+
+// ---------- AD HOC ----------
+function adhocLista() { return bazaWczytaj().adhoc; }
+function adhocDodaj(t) { bazaMutuj(b => b.adhoc.push({ ...t, id: uidB() })); }
+function adhocUstaw(id, zmiany) { bazaMutuj(b => { const t = b.adhoc.find(x => x.id === id); if (t) Object.assign(t, zmiany); }); }
+
+// ---------- EKSPORT / IMPORT ----------
+function bazaEksport() {
+  const b = bazaWczytaj();
+  const blob = new Blob([JSON.stringify(b, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `workfly_${new Date().toISOString().slice(0, 10)}.json`;
+  a.click(); URL.revokeObjectURL(a.href);
+}
+function bazaImport(plik, poImporcie) {
+  const r = new FileReader();
+  r.onload = () => {
+    try {
+      const dane = JSON.parse(r.result);
+      if (!dane || !Array.isArray(dane.procesy)) { alert('To nie wygląda na plik bazy WORKFLY.'); return; }
+      _cache = dane; bazaZapisz();
+      if (poImporcie) poImporcie();
+    } catch (e) { alert('Nie udało się wczytać pliku: ' + e.message); }
+  };
+  r.readAsText(plik);
+}
+function bazaWyczysc() { _cache = MAGAZYN_PUSTY(); bazaZapisz(); }
+
+// hook: re-render przy każdej zmianie bazy (z dowolnego modułu)
+function useBaza() {
+  const [, setTick] = useState(0);
+  useEffect(() => bazaSubskrybuj(() => setTick(t => t + 1)), []);
+  return bazaWczytaj();
+}
+
+const ModModelowanie = (function() {
+// ============================================================
+// WORKFLY — makieta UX modelowania procesów (rdzeń uniwersalny)
+// v5: 9 poprawek — kolejność po rozgałęzieniu, poziomy layout
+// gałęzi, stan ścieżek, niezależność gałęzi, SLA godz/dni,
+// "Zbadaj proces" (struktura + sygnały), tryb pełnoekranowy,
+// Montserrat, branding WORKFLY + stopka ZMIANOLOGICA.
+// PROTOTYP INTERAKCJI — nie narzędzie produkcyjne (brak zapisu).
+// ============================================================
+
+const START_STANOWISKA = ["Klient", "Koordynator", "Specjalista", "Kierownik", "Kontrola jakości", "Księgowość"];
+const TYPY_DALEJ = [
+  { id: "seq", label: "Następny krok", opis: "Po prostu kolejne zadanie, bez warunków. Najczęstszy wybór." },
+  { id: "xor", label: "Decyzja — jedna z kilku ścieżek (XOR)", opis: "Idziemy dokładnie jedną drogą. Sam nazywasz ścieżki." },
+  { id: "and", label: "Kilka rzeczy równolegle (AND)", opis: "Wszystkie ścieżki naraz. Dalej ruszamy, gdy skończą się wszystkie." },
+  { id: "zejscie", label: "Tu ścieżki się schodzą", opis: "Ta gałąź łączy się z istniejącym krokiem." },
+  { id: "petla", label: "↩ Powrót do wcześniejszego kroku (pętla)", opis: "Wróć wstecz i powtórz fragment — np. poprawki aż do akceptacji. Tylko po decyzji (XOR)." },
+  { id: "koniec", label: "To już koniec procesu", opis: "Ten krok / ta ścieżka daje finalny produkt." },
+];
+
+function WorkflyApp() {
+  const [zalogowany, setZalogowany] = useState(false);
+  const [org, setOrg] = useState("");
+  const [user, setUser] = useState("");
+  if (!zalogowany) return <Login org={org} setOrg={setOrg} user={user} setUser={setUser} onLogin={() => (org.trim() && user.trim()) && setZalogowany(true)} />;
+  return <Studio org={org} user={user} onLogout={() => setZalogowany(false)} />;
+}
+
+function Login({ org, setOrg, user, setUser, onLogin }) {
+  return (
+    <div style={styles.app}>
+      <style>{css}</style>
+      <div className="login-wrap">
+        <div className="login-card">
+          <div className="logo-big">WORKFLY</div>
+          <div className="haslo">od procesu do efektów</div>
+          <p className="login-info">Narzędzie obsługuje wiele organizacji. To logowanie jest pozorne — wpisz cokolwiek.</p>
+          <label className="lbl">Organizacja</label>
+          <input className="inp" autoFocus value={org} onChange={e => setOrg(e.target.value)} placeholder="np. ZMIANOLOGICA" />
+          <label className="lbl">Użytkownik</label>
+          <input className="inp" value={user} onChange={e => setUser(e.target.value)} placeholder="np. Marcin" onKeyDown={e => e.key === "Enter" && onLogin()} />
+          <button className="btn-primary" style={{ marginTop: 14 }} onClick={onLogin}>Wejdź →</button>
+        </div>
+      </div>
+      <Stopka />
+    </div>
+  );
+}
+
+function Stopka() {
+  return <div className="stopka">ZMIANOLOGICA · Dr Marcin Żółtak</div>;
+}
+
+function Studio({ org, user, onLogout }) {
+  const [procesNazwa, setProcesNazwa] = useState("");
+  const [stanowiska, setStanowiska] = useState(START_STANOWISKA);
+  const [godzinyStan, setGodzinyStan] = useState({}); // stanowisko -> {od, do}
+  const [panelStan, setPanelStan] = useState(false);
+  const [kroki, setKroki] = useState([]);
+  const [przejscia, setPrzejscia] = useState([]);
+  const [otwarte, setOtwarte] = useState([]); // {galazId, bramkaId, etykieta, bramka, pierwszyKrok}
+
+  const [aktywnyProc, setAktywnyProc] = useState(null); // rekord procesu z magazynu (id, rodzinaId, wersja, status)
+  const baza = useBaza();
+  const [faza, setFaza] = useState("biblioteka"); // biblioteka|nazwa|wybor-sciezki|krok|dalej|gotowe|edycja
+  const [ostatniKrok, setOstatniKrok] = useState(null);
+  const [biezacyWatek, setBiezacyWatek] = useState(null);
+  const [edytowany, setEdytowany] = useState(null);
+  const [historia, setHistoria] = useState([]);
+  const [pelnyEkran, setPelnyEkran] = useState(false);
+  const [raport, setRaport] = useState(null); // wynik "Zbadaj proces"
+  const [podpowiedzi, setPodpowiedzi] = useState(true);
+  const [widokProcesu, setWidokProcesu] = useState("diagram"); // diagram | tabela
+  const [kopie, setKopie] = useState([]); // kopie procesu w sesji (makieta)
+
+  // bufory kroku
+  const [kNazwa, setKNazwa] = useState("");
+  const [kStanowisko, setKStanowisko] = useState("");
+  const [kSla, setKSla] = useState("");
+  const [kSlaJedn, setKSlaJedn] = useState("dni"); // dni | godz
+  const [kTiketowy, setKTiketowy] = useState(true); // pokaż pracownikowi (T) / niewidoczny (NT)
+  const [kWymagaZdjecia, setKWymagaZdjecia] = useState(false); // krok wymaga zdjęcia-dowodu
+  const [kLinki, setKLinki] = useState([]);
+  // bufory "co dalej"
+  const [wyborDalej, setWyborDalej] = useState("seq");
+  const [galezie, setGalezie] = useState([{ etykieta: "" }, { etykieta: "" }]);
+  const [celZejscia, setCelZejscia] = useState("");
+  const [celPetli, setCelPetli] = useState("");
+  const [limitPetli, setLimitPetli] = useState("");
+  // bufory świeżej bramki (do fazy wybor-sciezki)
+  const [swiezeBramkaId, setSwiezeBramkaId] = useState(null);
+
+  const uid = () => Math.random().toString(36).slice(2, 9);
+  const numeracja = useMemo(() => buildNumeracja(kroki, przejscia), [kroki, przejscia]);
+
+  // AUTOZAPIS (v6): stan roboczy szkicu trafia do magazynu przy każdej zmianie
+  useEffect(() => {
+    if (!aktywnyProc || faza === "biblioteka") return;
+    procesZapiszSzkic({ ...aktywnyProc, nazwa: procesNazwa || aktywnyProc.nazwa, kroki, przejscia, otwarte });
+  }, [kroki, przejscia, procesNazwa, otwarte, aktywnyProc, faza]);
+  const walidacja = useMemo(() => waliduj(kroki, przejscia, otwarte), [kroki, przejscia, otwarte]);
+
+  function snapshot() {
+    setHistoria(h => [...h.slice(-19), JSON.stringify({ kroki, przejscia, otwarte, ostatniKrok, biezacyWatek, faza, stanowiska, edytowany, swiezeBramkaId })]);
+  }
+  function cofnij() {
+    if (!historia.length) return;
+    const s = JSON.parse(historia[historia.length - 1]);
+    setKroki(s.kroki); setPrzejscia(s.przejscia); setOtwarte(s.otwarte);
+    setOstatniKrok(s.ostatniKrok); setBiezacyWatek(s.biezacyWatek);
+    setFaza(s.faza); setStanowiska(s.stanowiska); setEdytowany(s.edytowany || null); setSwiezeBramkaId(s.swiezeBramkaId || null);
+    setHistoria(h => h.slice(0, -1)); setRaport(null);
+  }
+
+  function zatwierdzNazwe() {
+    if (!procesNazwa.trim()) return;
+    snapshot();
+    if (!aktywnyProc) { const p = procesNowy(procesNazwa.trim()); setAktywnyProc(p); }
+    setOstatniKrok(null); setBiezacyWatek(null); setFaza("krok");
+  }
+
+  function wczytajProces(p, jakoNowaWersja) {
+    const rekord = jakoNowaWersja ? procesNowaWersja(p.id) : p;
+    if (!rekord) return;
+    setAktywnyProc(rekord);
+    setProcesNazwa(rekord.nazwa || "");
+    setKroki(rekord.kroki || []); setPrzejscia(rekord.przejscia || []); setOtwarte(rekord.otwarte || []);
+    setOstatniKrok(null); setBiezacyWatek(null); setEdytowany(null); setHistoria([]);
+    setFaza((rekord.kroki || []).length ? "gotowe" : "krok");
+  }
+  function nowyProces() {
+    setAktywnyProc(null); setProcesNazwa("");
+    setKroki([]); setPrzejscia([]); setOtwarte([]);
+    setOstatniKrok(null); setBiezacyWatek(null); setEdytowany(null); setHistoria([]);
+    setFaza("nazwa");
+  }
+  function doBiblioteki() { setFaza("biblioteka"); }
+  function opublikuj() {
+    if (!aktywnyProc || !walidacja.ok || otwarte.length) return;
+    procesZapiszSzkic({ ...aktywnyProc, nazwa: procesNazwa, kroki, przejscia, otwarte: [] });
+    procesOpublikuj(aktywnyProc.id);
+    setAktywnyProc(a => a ? { ...a, status: "opublikowany" } : a);
+  }
+
+  function resetBufor() { setKNazwa(""); setKStanowisko(""); setKSla(""); setKSlaJedn("dni"); setKTiketowy(true); setKWymagaZdjecia(false); setKLinki([]); }
+
+  // edycja atrybutu kroku wprost z tabeli (NIE rusza struktury/przejść)
+  function edytujAtrybutKroku(id, pole, wartosc) {
+    setKroki(ks => ks.map(k => k.id === id ? { ...k, [pole]: wartosc } : k));
+    if (pole === "stanowisko" && wartosc.trim() && !stanowiska.includes(wartosc.trim()) && wartosc.trim() !== "Nieprzypisane") {
+      setStanowiska(s => [...s, wartosc.trim()]);
+    }
+  }
+
+  // kopia procesu w pamięci sesji (makieta — nie ma trwałego zapisu)
+  function kopiujProces() {
+    const nazwa = (procesNazwa || "Proces") + " — kopia";
+    setKopie(k => [...k, { nazwa, kroki: JSON.parse(JSON.stringify(kroki)), przejscia: [...przejscia], czas: new Date().toLocaleTimeString("pl-PL", {hour:"2-digit",minute:"2-digit"}) }]);
+    alert("Proces skopiowany w tej sesji jako „" + nazwa + "”.\n\nTo makieta — kopia żyje do odświeżenia strony. W realnej aplikacji kopie zapisują się trwale i można je otwierać z listy procesów.");
+  }
+
+  function dodajKrok() {
+    if (!kNazwa.trim()) return;
+    snapshot();
+    const st = kStanowisko.trim() || "Nieprzypisane";
+    if (st !== "Nieprzypisane" && !stanowiska.includes(st)) setStanowiska(s => [...s, st]);
+    const id = uid();
+    setKroki(k => [...k, { id, nazwa: kNazwa.trim(), typ: "zadanie", stanowisko: st, sla: kSla.trim(), slaJedn: kSlaJedn, tiketowy: kTiketowy, wymagaZdjecia: kWymagaZdjecia, linki: kLinki.filter(l => l.nazwa.trim()) }]);
+    if (ostatniKrok) {
+      const etk = biezacyWatek ? biezacyWatek.etykieta : "następny";
+      const br = biezacyWatek ? biezacyWatek.bramka : null;
+      setPrzejscia(p => [...p, { id: uid(), zrodlo: ostatniKrok, cel: id, etykieta: etk, bramka: br }]);
+      // gałąź dostała pierwszy krok → oznacz w rejestrze "w trakcie"
+      if (biezacyWatek) setOtwarte(o => o.map(w => w.galazId === biezacyWatek.galazId ? { ...w, pierwszyKrok: id } : w));
+    }
+    setOstatniKrok(id);
+    setBiezacyWatek(bw => bw ? { ...bw, weszlo: true } : null);
+    resetBufor();
+    setWyborDalej("seq"); setGalezie([{ etykieta: "" }, { etykieta: "" }]); setCelZejscia(""); setCelPetli(""); setLimitPetli("");
+    setFaza("dalej");
+  }
+
+  function zatwierdzDalej() {
+    snapshot();
+    if (wyborDalej === "seq") { setFaza("krok"); return; }
+    if (wyborDalej === "koniec") {
+      setKroki(ks => ks.map(k => k.id === ostatniKrok ? { ...k, typ: "koniec" } : k));
+      domknijBiezacaGalaz();
+      nastepnyWatek(); return;
+    }
+    if (wyborDalej === "zejscie") {
+      if (celZejscia) setPrzejscia(p => [...p, { id: uid(), zrodlo: ostatniKrok, cel: celZejscia, etykieta: "zejście", bramka: null }]);
+      domknijBiezacaGalaz();
+      nastepnyWatek(); return;
+    }
+    if (wyborDalej === "petla") {
+      if (celPetli) setPrzejscia(p => [...p, { id: uid(), zrodlo: ostatniKrok, cel: celPetli, etykieta: "↩ powrót", bramka: null, petla: true, limit: limitPetli.trim() ? parseInt(limitPetli) : null }]);
+      domknijBiezacaGalaz();
+      nastepnyWatek(); return;
+    }
+    // XOR / AND — tworzymy bramkę, ale NIE wchodzimy od razu w gałąź (poprawka #1)
+    const bid = uid();
+    setKroki(k => [...k, { id: bid, nazwa: wyborDalej === "xor" ? "Decyzja" : "Rozdzielenie równoległe", typ: "bramka", podtyp: wyborDalej.toUpperCase(), stanowisko: "—", sla: "" }]);
+    setPrzejscia(p => [...p, { id: uid(), zrodlo: ostatniKrok, cel: bid, etykieta: "następny", bramka: null }]);
+    const watki = galezie.map((g, i) => ({ galazId: uid(), bramkaId: bid, etykieta: g.etykieta.trim() || `Ścieżka ${i + 1}`, bramka: wyborDalej.toUpperCase(), pierwszyKrok: null }));
+    setOtwarte(o => [...o, ...watki]);
+    setSwiezeBramkaId(bid);
+    setBiezacyWatek(null);
+    setFaza("wybor-sciezki"); // poprawka #1: najpierw wybór, potem formularz
+  }
+
+  // domknij gałąź, którą właśnie skończyliśmy (usuń z otwartych)
+  function domknijBiezacaGalaz() {
+    if (biezacyWatek) setOtwarte(o => o.filter(w => w.galazId !== biezacyWatek.galazId));
+  }
+
+  function wejdzWGalaz(w) {
+    snapshot();
+    setBiezacyWatek({ bramkaId: w.bramkaId, etykieta: w.etykieta, bramka: w.bramka, galazId: w.galazId, weszlo: false });
+    setOstatniKrok(w.bramkaId);
+    setEdytowany(null);
+    setSwiezeBramkaId(null);
+    setFaza("krok");
+  }
+
+  function wejdzWGalazZGrafu(etykieta, galazId) {
+    const w = otwarte.find(o => o.galazId === galazId) || otwarte.find(o => o.etykieta === etykieta);
+    if (w) wejdzWGalaz(w);
+  }
+
+  function nastepnyWatek() {
+    const akt = biezacyWatek?.galazId;
+    const poz = otwarte.filter(o => o.galazId !== akt);
+    if (poz.length) { setSwiezeBramkaId(null); setFaza("wybor-sciezki"); }
+    else { setBiezacyWatek(null); setOstatniKrok(null); setFaza("gotowe"); }
+  }
+
+
+  function klikKrok(k) {
+    if (k.typ === "bramka") return;
+    snapshot();
+    setEdytowany(k.id);
+    setKNazwa(k.nazwa); setKStanowisko(k.stanowisko === "Nieprzypisane" ? "" : k.stanowisko);
+    setKSla(k.sla); setKSlaJedn(k.slaJedn || "dni"); setKTiketowy(k.tiketowy !== false); setKWymagaZdjecia(k.wymagaZdjecia === true); setKLinki(k.linki?.length ? [...k.linki] : []);
+    setFaza("edycja"); setPelnyEkran(false);
+  }
+  function zapiszEdycje() {
+    if (!kNazwa.trim()) return;
+    snapshot();
+    const st = kStanowisko.trim() || "Nieprzypisane";
+    if (st !== "Nieprzypisane" && !stanowiska.includes(st)) setStanowiska(s => [...s, st]);
+    setKroki(ks => ks.map(k => k.id === edytowany ? { ...k, nazwa: kNazwa.trim(), stanowisko: st, sla: kSla.trim(), slaJedn: kSlaJedn, tiketowy: kTiketowy, wymagaZdjecia: kWymagaZdjecia, linki: kLinki.filter(l => l.nazwa.trim()) } : k));
+    zakonczEdycje();
+  }
+  function usunIZastap() {
+    const id = edytowany;
+    const wej = przejscia.filter(p => p.cel === id);
+    const wy = przejscia.filter(p => p.zrodlo === id);
+    snapshot();
+    let nowe = przejscia.filter(p => p.zrodlo !== id && p.cel !== id);
+    if (wej.length && wy.length) wej.forEach(a => wy.forEach(b => nowe.push({ id: uid(), zrodlo: a.zrodlo, cel: b.cel, etykieta: a.etykieta, bramka: a.bramka })));
+    setPrzejscia(nowe);
+    setKroki(ks => ks.filter(k => k.id !== id));
+    setOstatniKrok(wej[0]?.zrodlo || null);
+    setBiezacyWatek(null);
+    resetBufor(); setEdytowany(null); setFaza("krok");
+  }
+  function zakonczEdycje() { setEdytowany(null); resetBufor(); setFaza("gotowe"); }
+
+  // #12: kontynuuj proces od istniejącego kroku (z trybu edycji)
+  function kontynuujOdEdytowanego() {
+    if (!edytowany) return;
+    snapshot();
+    setOstatniKrok(edytowany);
+    setBiezacyWatek(null);
+    setEdytowany(null);
+    resetBufor();
+    setWyborDalej("seq"); setGalezie([{ etykieta: "" }, { etykieta: "" }]); setCelZejscia(""); setCelPetli(""); setLimitPetli("");
+    setFaza("dalej");
+  }
+
+  function usunKrok(id) {
+    snapshot();
+    const wej = przejscia.filter(p => p.cel === id);
+    const wy = przejscia.filter(p => p.zrodlo === id);
+    let nowe = przejscia.filter(p => p.zrodlo !== id && p.cel !== id);
+    if (wej.length && wy.length) wej.forEach(a => wy.forEach(b => nowe.push({ id: uid(), zrodlo: a.zrodlo, cel: b.cel, etykieta: a.etykieta, bramka: a.bramka })));
+    setPrzejscia(nowe);
+    setKroki(ks => ks.filter(k => k.id !== id));
+    if (ostatniKrok === id) setOstatniKrok(wej[0]?.zrodlo || null);
+    if (edytowany === id) zakonczEdycje();
+  }
+
+  function dodajLink() { setKLinki([...kLinki, { nazwa: "", url: "" }]); }
+  function zmienLink(i, p, v) { setKLinki(ls => ls.map((l, j) => j === i ? { ...l, [p]: v } : l)); }
+  function usunLink(i) { setKLinki(ls => ls.filter((_, j) => j !== i)); }
+  function usunGalaz(i) { if (galezie.length > 2) setGalezie(gs => gs.filter((_, j) => j !== i)); }
+
+  function zbadajProces() {
+    setRaport(analizujProces(kroki, przejscia, otwarte, numeracja, stanowiska));
+  }
+
+  // stan gałęzi w rejestrze (poprawka #3)
+  function stanGalezi(w) {
+    if (!w.pierwszyKrok) return { etykieta: "pusta", klasa: "stan-pusta" };
+    // czy ścieżka domknięta? sprawdź czy ostatni krok ścieżki ma wyjście / koniec
+    return { etykieta: "w trakcie", klasa: "stan-wtrakcie" };
+  }
+
+  const swiezeBramkaWatki = otwarte.filter(w => w.bramkaId === swiezeBramkaId);
+  const watkiDoWyboru = swiezeBramkaId ? swiezeBramkaWatki : otwarte;
+
+  if (pelnyEkran) {
+    return (
+      <div style={styles.app}>
+        <style>{css}</style>
+        <header style={styles.header}>
+          <div><div className="logo-sm">WORKFLY</div><h1 style={styles.h1}>{procesNazwa || "Nowy proces"}</h1></div>
+          <div style={styles.statusBox}>
+            <button className="undo" onClick={() => setPelnyEkran(false)}>◖ Wróć do edycji</button>
+          </div>
+        </header>
+        <div style={{ maxWidth: 1320, margin: "0 auto" }}>
+          <div style={{ ...styles.canvas, minHeight: 700 }}>
+            <div style={styles.panelTitle}>◗ Pełny widok procesu</div>
+            {kroki.length === 0 ? <div className="pusto">Brak kroków.</div>
+              : <Diagram kroki={kroki} przejscia={przejscia} numeracja={numeracja} otwarte={otwarte} edytowany={null} onKlik={klikKrok} onUsun={usunKrok} onZaslepka={wejdzWGalazZGrafu} />}
+          </div>
+        </div>
+        <Stopka />
+      </div>
+    );
+  }
+
+  return (
+    <div style={styles.app} className={podpowiedzi ? "" : "bez-podpowiedzi"}>
+      <style>{css}</style>
+      <header style={styles.header}>
+        <div><div className="logo-sm">WORKFLY · {org} · {user}</div><h1 style={styles.h1}>{procesNazwa || "Nowy proces"}</h1></div>
+        <div style={styles.statusBox}>
+          <button className="undo" data-tip="Cofnij ostatnią zmianę w projekcie" onClick={cofnij} disabled={!historia.length}>↶ Cofnij</button>
+          <span>Kroki: <b>{kroki.filter(k => k.typ !== "bramka").length}</b></span>
+          <span style={{ color: walidacja.ok ? "#86b889" : "#fbbf24" }}>{walidacja.ok ? "● domknięty" : `● ${walidacja.problemy.length}`}</span>
+          {faza !== "biblioteka" && <button className="undo" onClick={doBiblioteki}>📚 Biblioteka</button>}
+          {faza !== "biblioteka" && aktywnyProc && (
+            aktywnyProc.status === "opublikowany"
+              ? <span className="proc-status proc-pub">● opublikowany v{aktywnyProc.wersja}</span>
+              : <button className="undo proc-publikuj" data-tip={!walidacja.ok || otwarte.length ? "Najpierw domknij strukturę (Zbadaj proces)" : "Udostępnij do uruchamiania zleceń"} disabled={!walidacja.ok || otwarte.length > 0} onClick={opublikuj}>▲ Opublikuj v{aktywnyProc.wersja}</button>
+          )}
+          <button className="undo" data-tip="Słownik stanowisk i godzin pracy — wspólny dla całej organizacji" onClick={() => setPanelStan(true)}>👥 Stanowiska</button>
+          <button className="undo" onClick={onLogout}>Wyloguj</button>
+        </div>
+      </header>
+
+      <div style={styles.grid}>
+        {/* LEWA */}
+        <div style={styles.panel}>
+          <div style={styles.panelTitle}>◖ Projektowanie</div>
+
+          {biezacyWatek && faza !== "edycja" && <div className="biezacy-watek">Domykasz ścieżkę: <b>„{biezacyWatek.etykieta}”</b></div>}
+
+          {faza === "biblioteka" && (
+            <Biblioteka baza={baza} onNowy={nowyProces} onOtworz={wczytajProces} />
+          )}
+
+          {faza === "nazwa" && (
+            <Krok pytanie="Jak nazywa się proces?">
+              <input className="inp" autoFocus value={procesNazwa} onChange={e => setProcesNazwa(e.target.value)} placeholder="np. Obsługa reklamacji" onKeyDown={e => e.key === "Enter" && zatwierdzNazwe()} />
+              <button className="btn-primary" onClick={zatwierdzNazwe}>Dalej →</button>
+            </Krok>
+          )}
+
+
+          {/* poprawka #1: wybór ścieżki PRZED formularzem */}
+          {faza === "wybor-sciezki" && (
+            <Krok pytanie="Którą ścieżkę teraz opisujesz?" podpowiedz="Wybierz gałąź, którą chcesz poprowadzić. Formularz kroku pojawi się po wyborze.">
+              {watkiDoWyboru.map(w => {
+                const stan = stanGalezi(w);
+                return (
+                  <button key={w.galazId} className="wybor-galaz" onClick={() => wejdzWGalaz(w)}>
+                    <span className="wg-bramka">{numeracja[w.bramkaId] || "?"} {w.bramka}</span>
+                    <span className="wg-etyk">„{w.etykieta}”</span>
+                    <span className={"wg-stan " + stan.klasa}>{stan.etykieta}</span>
+                  </button>
+                );
+              })}
+            </Krok>
+          )}
+
+          {(faza === "krok" || faza === "edycja") && (
+            <Krok pytanie={faza === "edycja" ? "Edycja kroku" : (ostatniKrok ? (biezacyWatek ? `Następny krok ścieżki „${biezacyWatek.etykieta}”?` : "Jaki jest następny krok?") : "Jaki jest pierwszy krok procesu?")}>
+              <label className="lbl">Nazwa kroku</label>
+              <input className="inp" autoFocus value={kNazwa} onChange={e => setKNazwa(e.target.value)} placeholder="np. Rejestracja zgłoszenia" />
+              <label className="lbl">Kto wykonuje? <span className="hint">(wybierz lub wpisz nowe)</span></label>
+              <input className="inp" list="stanowiska" value={kStanowisko} onChange={e => setKStanowisko(e.target.value)} placeholder="Stanowisko" />
+              <datalist id="stanowiska">{stanowiska.map(s => <option key={s} value={s} />)}</datalist>
+              <div className="przel-wrap">
+                <button className={"przel-btn" + (kTiketowy ? " przel-on" : "")} onClick={() => { const v = !kTiketowy; setKTiketowy(v); if (!v) setKWymagaZdjecia(false); }}>
+                  <span className="przel-lampka" />
+                  <span className="przel-txt"><b>Zadanie dla pracownika</b><span>{kTiketowy ? "pokazuje się na liście pracownika" : "niewidoczne dla pracownika — krok zostaje w procesie"}</span></span>
+                </button>
+                <button className={"przel-btn" + (kWymagaZdjecia ? " przel-on przel-on-foto" : "") + (!kTiketowy ? " przel-blok" : "")} disabled={!kTiketowy} title={!kTiketowy ? "Krok niewidoczny dla pracownika — nie ma kto zrobić zdjęcia. Włącz najpierw „Zadanie dla pracownika”." : undefined} onClick={() => kTiketowy && setKWymagaZdjecia(!kWymagaZdjecia)}>
+                  <span className="przel-lampka" />
+                  <span className="przel-txt"><b>📷 Wymaga zdjęcia-dowodu</b><span>{!kTiketowy ? "niedostępne — krok niewidoczny dla pracownika" : (kWymagaZdjecia ? "nie można domknąć bez dowodu" : "dowód niewymagany")}</span></span>
+                </button>
+              </div>
+              <label className="lbl">Czas realizacji (SLA)</label>
+              <div className="sla-row">
+                <input className="inp" type="number" min="0" value={kSla} onChange={e => setKSla(e.target.value)} placeholder="np. 2" style={{ flex: 1 }} />
+                <div className="jedn-toggle">
+                  <button className={kSlaJedn === "godz" ? "jedn-on" : ""} onClick={() => setKSlaJedn("godz")}>godz.</button>
+                  <button className={kSlaJedn === "dni" ? "jedn-on" : ""} onClick={() => setKSlaJedn("dni")}>dni</button>
+                </div>
+              </div>
+              <label className="lbl">Zasoby / linki <span className="hint">(dowolny adres)</span></label>
+              {kLinki.map((l, i) => (
+                <div key={i} className="link-row">
+                  <input className="inp inp-sm" style={{ flex: "0 0 38%" }} value={l.nazwa} onChange={e => zmienLink(i, "nazwa", e.target.value)} placeholder="nazwa" />
+                  <input className="inp inp-sm" style={{ flex: 1 }} value={l.url} onChange={e => zmienLink(i, "url", e.target.value)} placeholder="https://…" />
+                  <button className="x-btn" onClick={() => usunLink(i)}>×</button>
+                </div>
+              ))}
+              <button className="btn-ghost" onClick={dodajLink}>+ dodaj zasób / link</button>
+              {faza === "edycja" ? (
+                <div className="edycja-akcje">
+                  <button className="btn-primary" onClick={zapiszEdycje}>Zapisz zmiany</button>
+                  <button className="btn-cont" onClick={kontynuujOdEdytowanego}>➜ Co dalej po tym kroku?</button>
+                  <button className="btn-warn" onClick={usunIZastap}>Usuń i zastąp nowym</button>
+                  <button className="btn-danger" onClick={() => usunKrok(edytowany)}>Usuń krok</button>
+                  <button className="btn-ghost" onClick={zakonczEdycje}>Anuluj</button>
+                </div>
+              ) : (
+                <button className="btn-primary" onClick={dodajKrok}>{ostatniKrok ? "Dodaj krok →" : "Dodaj pierwszy krok →"}</button>
+              )}
+            </Krok>
+          )}
+
+          {faza === "dalej" && (
+            <Krok pytanie="Co dzieje się po tym kroku?" podpowiedz={biezacyWatek ? `Opisujesz ścieżkę „${biezacyWatek.etykieta}”. Może mieć własny koniec — nie musi się z niczym łączyć.` : null}>
+              {TYPY_DALEJ.map(t => (
+                <label key={t.id} className={"radio" + (wyborDalej === t.id ? " radio-on" : "")}>
+                  <input type="radio" name="dalej" checked={wyborDalej === t.id} onChange={() => setWyborDalej(t.id)} />
+                  <div><div className="radio-label">{t.label}</div><div className="radio-opis">{t.opis}</div></div>
+                </label>
+              ))}
+              {(wyborDalej === "xor" || wyborDalej === "and") && (
+                <div className="galezie">
+                  <div className="hint" style={{ marginBottom: 6 }}>Nazwij ścieżki:</div>
+                  {galezie.map((g, i) => (
+                    <div key={i} className="link-row">
+                      <input className="inp inp-sm" style={{ flex: 1 }} value={g.etykieta} onChange={e => setGalezie(gs => gs.map((x, j) => j === i ? { etykieta: e.target.value } : x))} placeholder={wyborDalej === "xor" ? `np. „zasadna”` : `ścieżka ${i + 1}`} />
+                      <button className="x-btn" disabled={galezie.length <= 2} onClick={() => usunGalaz(i)}>×</button>
+                    </div>
+                  ))}
+                  <button className="btn-ghost" onClick={() => setGalezie([...galezie, { etykieta: "" }])}>+ dodaj ścieżkę</button>
+                  {otwarte.length >= 2 && <div className="podpowiedz-soft">💡 Złożoność rośnie ({otwarte.length} otwartych ścieżek). Rozważ podproces — limitu nie ma.</div>}
+                </div>
+              )}
+              {wyborDalej === "zejscie" && (
+                <div className="galezie">
+                  <label className="lbl">Z którym istniejącym krokiem łączymy?</label>
+                  <select className="inp" value={celZejscia} onChange={e => setCelZejscia(e.target.value)}>
+                    <option value="">— wybierz —</option>
+                    {kroki.filter(k => k.typ !== "bramka" && k.id !== ostatniKrok).map(k => <option key={k.id} value={k.id}>{numeracja[k.id]} · {k.nazwa}</option>)}
+                  </select>
+                </div>
+              )}
+              {wyborDalej === "petla" && (
+                <div className="galezie">
+                  {!biezacyWatek && <div className="podpowiedz-soft">⚠ Pętla powinna wychodzić z gałęzi decyzji (XOR) — inaczej brak warunku wyjścia i pętla jest nieskończona.</div>}
+                  <label className="lbl">Wróć do którego wcześniejszego kroku?</label>
+                  <select className="inp" value={celPetli} onChange={e => setCelPetli(e.target.value)}>
+                    <option value="">— wybierz punkt powrotu —</option>
+                    {kroki.filter(k => k.typ !== "bramka" && k.id !== ostatniKrok).map(k => <option key={k.id} value={k.id}>{numeracja[k.id]} · {k.nazwa}</option>)}
+                  </select>
+                  <label className="lbl" style={{ marginTop: 10 }}>Limit powtórzeń (opcjonalnie)</label>
+                  <input className="inp" type="number" min="1" value={limitPetli} onChange={e => setLimitPetli(e.target.value)} placeholder="np. 5 — puste = bez limitu" />
+                  <div className="podpowiedz-soft">↩ Cały odcinek od wybranego kroku do tej decyzji powtórzy się. Każde powtórzenie tworzy nowy komplet tiketów (z numerem podejścia).</div>
+                </div>
+              )}
+              <button className="btn-primary" onClick={zatwierdzDalej}>Zatwierdź →</button>
+            </Krok>
+          )}
+
+          {faza === "gotowe" && (
+            <Krok pytanie="Co dalej z procesem?">
+              {ostatniKrok && <button className="btn-primary" onClick={() => setFaza("dalej")}>+ Co dalej po tym kroku?</button>}
+              <div className="info">▶ Kliknij krok na diagramie, aby go edytować/zastąpić/usunąć. Użyj „Zbadaj proces”, by sprawdzić logikę.</div>
+            </Krok>
+          )}
+
+          {/* rejestr otwartych ścieżek ze stanem (poprawka #3) */}
+          {otwarte.length > 0 && (
+            <div className="rejestr">
+              <div className="rejestr-head">⚠ Otwarte ścieżki ({otwarte.length})</div>
+              {otwarte.map(w => {
+                const stan = stanGalezi(w);
+                return (
+                  <button key={w.galazId} className={"rejestr-item" + (biezacyWatek?.galazId === w.galazId ? " rejestr-aktywny" : "")} onClick={() => wejdzWGalaz(w)}>
+                    <span className="rejestr-bramka">{numeracja[w.bramkaId] || "?"} {w.bramka}</span>
+                    <span className="rejestr-etykieta">„{w.etykieta}”</span>
+                    <span className={"wg-stan " + stan.klasa}>{stan.etykieta}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* PRAWA */}
+        <div style={styles.canvas}>
+          <div style={styles.panelTitle}>
+            ◗ Wizualny proces
+            <span className="canvas-akcje">
+              <span className="widok-przel">
+                <button className={widokProcesu === "diagram" ? "wp-on" : ""} data-tip="Widok graficzny — przepływ procesu ze strzałkami" onClick={() => setWidokProcesu("diagram")}>Diagram</button>
+                <button className={widokProcesu === "tabela" ? "wp-on" : ""} data-tip="Widok tabeli — szybka edycja danych kroków (nazwa, T/NT, stanowisko, SLA)" onClick={() => setWidokProcesu("tabela")} disabled={!kroki.length}>Tabela</button>
+              </span>
+              <button className="mini-btn" data-tip="Stwórz kopię procesu, by eksperymentować bez ruszania oryginału" onClick={kopiujProces} disabled={!kroki.length}>⧉ Kopiuj proces</button>
+              <button className="mini-btn" data-tip="Sprawdź logikę: błędy struktury i sygnały do rozważenia" onClick={zbadajProces} disabled={!kroki.length}>🔍 Zbadaj proces</button>
+              <button className="mini-btn" data-tip="Pokaż sam diagram na całym ekranie" onClick={() => setPelnyEkran(true)} disabled={!kroki.length}>⛶ Pełny ekran</button>
+            </span>
+          </div>
+          {kroki.length === 0 ? <div className="pusto">Diagram zbuduje się tu w trakcie projektowania →</div>
+            : widokProcesu === "tabela"
+              ? <TabelaKrokow kroki={kroki} numeracja={numeracja} stanowiska={stanowiska} onEdytuj={edytujAtrybutKroku} onKlik={klikKrok} />
+              : <Diagram kroki={kroki} przejscia={przejscia} numeracja={numeracja} otwarte={otwarte} edytowany={edytowany} onKlik={klikKrok} onUsun={usunKrok} onZaslepka={wejdzWGalazZGrafu} />}
+
+          {raport && <RaportBadania raport={raport} onZamknij={() => setRaport(null)} />}
+
+          {kroki.length > 0 && !raport && (
+            <div className={"walid " + (walidacja.ok ? "walid-ok" : "walid-warn")}>
+              <div className="walid-head">{walidacja.ok ? "✓ Struktura domknięta" : "Sygnały struktury:"}</div>
+              {walidacja.problemy.map((p, i) => <div key={i} className="walid-item">• {p}</div>)}
+            </div>
+          )}
+        </div>
+      </div>
+      <div className="dol-pasek">
+        <label className="podp-suwak">
+          <input type="checkbox" checked={podpowiedzi} onChange={e => setPodpowiedzi(e.target.checked)} />
+          <span className="podp-track"><span className="podp-galka" /></span>
+          <span className="podp-label">Podpowiedzi {podpowiedzi ? "wł." : "wył."}</span>
+        </label>
+      </div>
+      <Stopka />
+    </div>
+  );
+}
+
+// ---------------- RAPORT "ZBADAJ PROCES" (poprawka #6) ----------------
+function RaportBadania({ raport, onZamknij }) {
+  return (
+    <div className="raport">
+      <div className="raport-head">
+        <span>🔍 Wynik badania procesu</span>
+        <button className="x-btn" onClick={onZamknij}>×</button>
+      </div>
+      <div className="raport-sekcja">
+        <div className="raport-tytul raport-blad">● Błędy struktury — do naprawienia</div>
+        {raport.bledy.length === 0 ? <div className="raport-ok">✓ Brak błędów strukturalnych.</div>
+          : raport.bledy.map((b, i) => <div key={i} className="raport-item raport-item-blad">• {b}</div>)}
+      </div>
+      <div className="raport-sekcja">
+        <div className="raport-tytul raport-sygnal">● Sygnały sensowności — do rozważenia</div>
+        <div className="raport-disc">To podpowiedzi, nie błędy. Mogą być uzasadnione — oceń sam.</div>
+        {raport.sygnaly.length === 0 ? <div className="raport-ok">✓ Brak sygnałów.</div>
+          : raport.sygnaly.map((s, i) => <div key={i} className="raport-item raport-item-sygnal">• {s}</div>)}
+      </div>
+    </div>
+  );
+}
+
+function Krok({ pytanie, podpowiedz, children }) {
+  return (<div className="krok-kreatora"><div className="krok-pytanie">{pytanie}</div>{podpowiedz && <div className="krok-podpowiedz">{podpowiedz}</div>}<div className="krok-pola">{children}</div></div>);
+}
+
+// ---------------- DIAGRAM z poziomym layoutem gałęzi (poprawka #2) ----------------
+// Tabela kroków — edycja atrybutów w miejscu (NIE struktury/przejść)
+function Biblioteka({ baza, onNowy, onOtworz }) {
+  const importRef = useRef(null);
+  const grupy = {};
+  baza.procesy.forEach(p => { (grupy[p.rodzinaId] = grupy[p.rodzinaId] || []).push(p); });
+  const rodziny = Object.values(grupy).map(ws => ws.sort((a, b) => b.wersja - a.wersja));
+  const STATUS_ET = { szkic: ['szkic — w budowie', 'bib-szkic'], opublikowany: ['opublikowany', 'bib-pub'], wycofany: ['wycofany (obsługuje stare zlecenia)', 'bib-wyc'], archiwum: ['archiwum', 'bib-arch'] };
+  return (
+    <Krok pytanie="Biblioteka procesów" podpowiedz="Kontynuuj szkic, otwórz opublikowany do zmian (utworzy nową wersję) albo zacznij od zera.">
+      <button className="btn-primary" onClick={onNowy}>+ Nowy proces</button>
+      {rodziny.length === 0 && <div className="info">Brak zapisanych procesów. Zacznij od „Nowy proces".</div>}
+      {rodziny.map(ws => (
+        <div key={ws[0].rodzinaId} className="bib-rodzina">
+          <div className="bib-nazwa">{ws[0].nazwa}</div>
+          {ws.map(p => {
+            const [et, kl] = STATUS_ET[p.status] || [p.status, ''];
+            return (
+              <div key={p.id} className="bib-wersja">
+                <span className={"bib-status " + kl}>v{p.wersja} · {et}</span>
+                <span className="bib-akcje">
+                  {p.status === "szkic" && <>
+                    <button className="btn-ghost btn-sm" onClick={() => onOtworz(p, false)}>Kontynuuj</button>
+                    <button className="btn-ghost btn-sm" onClick={() => { if (window.confirm("Usunąć ten szkic?")) procesSzkicUsun(p.id); }}>Usuń</button>
+                  </>}
+                  {p.status === "opublikowany" && <button className="btn-ghost btn-sm" onClick={() => onOtworz(p, true)}>Edytuj → nowa wersja</button>}
+                  {p.status === "wycofany" && <span className="bib-hint">zarchiwizuje się po ostatnim zleceniu</span>}
+                  {p.status === "archiwum" && <button className="btn-ghost btn-sm" onClick={() => { if (window.confirm("Usunąć trwale z archiwum? Zlecenia historyczne stracą odniesienie do definicji.")) procesUsunZArchiwum(p.id); }}>Usuń z archiwum</button>}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      ))}
+      <div className="bib-stopka">
+        <button className="btn-ghost btn-sm" onClick={bazaEksport}>⬇ Eksportuj bazę (.json)</button>
+        <button className="btn-ghost btn-sm" onClick={() => importRef.current && importRef.current.click()}>⬆ Importuj bazę</button>
+        <input ref={importRef} type="file" accept=".json,application/json" style={{ display: "none" }}
+          onChange={e => { const f = e.target.files && e.target.files[0]; if (f && window.confirm("Import ZASTĄPI całą obecną bazę zawartością pliku. Kontynuować?")) bazaImport(f); e.target.value = ""; }} />
+        <span className="bib-hint">Baza żyje w tej przeglądarce — eksport to Twój backup i sposób przekazania danych.</span>
+      </div>
+    </Krok>
+  );
+}
+
+function TabelaKrokow({ kroki, numeracja, stanowiska, onEdytuj, onKlik }) {
+  const zadania = kroki.filter(k => k.typ === "zadanie");
+  if (!zadania.length) return <div className="pusto">Brak kroków-zadań do pokazania w tabeli. Bramki i punkty start/koniec edytuje się na diagramie.</div>;
+  return (
+    <div className="tabela-krokow">
+      <div className="tk-info">Edytujesz dane kroków-zadań. Przepływ (kolejność, bramki, ścieżki) zmienia się tylko na diagramie — tu go nie ruszasz.</div>
+      <div className="tk-naglowek">
+        <span className="tk-c-nr">Nr</span>
+        <span className="tk-c-nazwa">Zadanie</span>
+        <span className="tk-c-tnt">T/NT</span>
+        <span className="tk-c-stan">Stanowisko</span>
+        <span className="tk-c-sla">SLA</span>
+      </div>
+      {zadania.map(k => (
+        <div key={k.id} className="tk-wiersz">
+          <span className="tk-c-nr tk-nr">{numeracja[k.id] || "—"}</span>
+          <input className="tk-c-nazwa tk-inp" value={k.nazwa} onChange={e => onEdytuj(k.id, "nazwa", e.target.value)} />
+          <span className="tk-c-tnt">
+            <button className={"tk-tnt " + (k.tiketowy !== false ? "tk-t" : "tk-nt")} onClick={() => { const v = k.tiketowy === false; onEdytuj(k.id, "tiketowy", v); if (!v) onEdytuj(k.id, "wymagaZdjecia", false); }} title={k.tiketowy !== false ? "Widoczne dla pracownika — kliknij, by ukryć" : "Ukryte przed pracownikiem — kliknij, by pokazać"}>
+              {k.tiketowy !== false ? "widoczny" : "ukryty"}
+            </button>
+            <button className={"tk-foto " + (k.wymagaZdjecia ? "tk-foto-on" : "") + (k.tiketowy === false ? " tk-foto-blok" : "")} disabled={k.tiketowy === false} onClick={() => k.tiketowy !== false && onEdytuj(k.id, "wymagaZdjecia", !k.wymagaZdjecia)} title={k.tiketowy === false ? "Krok niewidoczny dla pracownika — dowód niedostępny" : (k.wymagaZdjecia ? "Wymaga zdjęcia-dowodu" : "Dowód niewymagany")}>📷</button>
+          </span>
+          <input className="tk-c-stan tk-inp" list="stanowiska-tab" value={k.stanowisko || ""} onChange={e => onEdytuj(k.id, "stanowisko", e.target.value)} />
+          <span className="tk-c-sla tk-sla-wrap">
+            <input className="tk-inp tk-sla" type="number" min="0" value={k.sla || ""} onChange={e => onEdytuj(k.id, "sla", e.target.value)} />
+            <button className="tk-jedn" onClick={() => onEdytuj(k.id, "slaJedn", (k.slaJedn || "dni") === "dni" ? "godz" : "dni")}>{k.slaJedn || "dni"}</button>
+          </span>
+        </div>
+      ))}
+      <datalist id="stanowiska-tab">{stanowiska.map(s => <option key={s} value={s} />)}</datalist>
+    </div>
+  );
+}
+
+function Diagram({ kroki, przejscia, numeracja, otwarte, edytowany, onKlik, onUsun, onZaslepka }) {
+  const wrapRef = useRef(null);
+  const nodeRefs = useRef({});
+  const [linie, setLinie] = useState([]);
+
+  // płaski układ rzędów (v6): sekwencja w dół, dzieci bramki obok siebie.
+  const rzedy = useMemo(() => buildUklad(kroki, przejscia, otwarte), [kroki, przejscia, otwarte]);
+
+  useLayoutEffect(() => {
+    const wrap = wrapRef.current;
+    if (!wrap) return;
+    const wr = wrap.getBoundingClientRect();
+    const nowe = [];
+    // realne przejścia (pętle pomijamy — pokazujemy je jako znaczniki, nie linie)
+    przejscia.forEach(p => {
+      if (p.petla) return;
+      const a = nodeRefs.current[p.zrodlo], b = nodeRefs.current[p.cel];
+      if (!a || !b) return;
+      const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+      nowe.push({ id: p.id, x1: ra.left - wr.left + ra.width / 2, y1: ra.bottom - wr.top, x2: rb.left - wr.left + rb.width / 2, y2: rb.top - wr.top, etykieta: p.etykieta, bramka: p.bramka });
+    });
+    // strzałki bramka -> zaślepka (puste ścieżki)
+    otwarte.forEach(w => {
+      const maRealne = przejscia.some(p => p.zrodlo === w.bramkaId && p.etykieta === w.etykieta);
+      if (maRealne) return;
+      const a = nodeRefs.current[w.bramkaId], b = nodeRefs.current["z_" + w.galazId];
+      if (!a || !b) return;
+      const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+      nowe.push({ id: "ez_" + w.galazId, x1: ra.left - wr.left + ra.width / 2, y1: ra.bottom - wr.top, x2: rb.left - wr.left + rb.width / 2, y2: rb.top - wr.top, etykieta: w.etykieta, bramka: w.bramka });
+    });
+    setLinie(nowe);
+  }, [rzedy, otwarte, edytowany, numeracja]);
+
+  return (
+    <div className="diagram" ref={wrapRef}>
+      <svg className="diagram-svg">
+        <defs>
+          <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#475569" />
+          </marker>
+        </defs>
+        {(() => {
+          // rozsuń starty krawędzi wychodzących z tego samego źródła (gałęzie bramki)
+          const grupy = {};
+          linie.forEach(l => { (grupy[Math.round(l.x1) + "_" + Math.round(l.y1)] = grupy[Math.round(l.x1) + "_" + Math.round(l.y1)] || []).push(l); });
+          Object.values(grupy).forEach(g => {
+            if (g.length < 2) return;
+            g.sort((a, b) => a.x2 - b.x2);
+            const krok = 18, start = -((g.length - 1) * krok) / 2;
+            g.forEach((l, i) => { l.x1o = l.x1 + start + i * krok; });
+          });
+          return linie.map(l => {
+            const x1 = l.x1o !== undefined ? l.x1o : l.x1;
+            const x2 = l.x2, y2k = l.y2 - 2;          // 2px luzu nad ramką celu
+            const yPoz = Math.max(l.y1 + 8, l.y2 - 16); // poziomy odcinek w przerwie tuż nad celem
+            const r = Math.min(10, Math.abs(x2 - x1) / 2, Math.max(1, (y2k - yPoz)));
+            const s = x2 > x1 ? 1 : -1;
+            const d = Math.abs(x2 - x1) < 4
+              ? `M ${x1} ${l.y1} L ${x1} ${y2k}`
+              : `M ${x1} ${l.y1} L ${x1} ${yPoz - r} Q ${x1} ${yPoz} ${x1 + s * r} ${yPoz} L ${x2 - s * r} ${yPoz} Q ${x2} ${yPoz} ${x2} ${yPoz + r} L ${x2} ${y2k}`;
+            return (
+              <g key={l.id}>
+                <path d={d} fill="none" stroke={l.bramka ? "#b08442" : "#475569"} strokeWidth="2" markerEnd="url(#arr)" />
+                {l.bramka && (
+                  <foreignObject x={(x1 + x2) / 2 - 45} y={yPoz - 22} width="90" height="20">
+                    <div className="edge-label">{l.etykieta}</div>
+                  </foreignObject>
+                )}
+              </g>
+            );
+          });
+        })()}
+      </svg>
+
+      <div className="diagram-tresc">
+        <div className="d-body">
+          {rzedy.map((rzad, ri) => (
+            <div key={ri} className="d-rzad">
+                    {rzad.map(k => {
+                      if (k.typ === "zaslepka") {
+                        return (
+                          <div key={k.id} ref={el => nodeRefs.current[k.id] = el}
+                            className="d-node d-zaslepka"
+                            onClick={() => onZaslepka && onZaslepka(k.etykieta, k.id.replace(/^z_/, ""))}
+                            title="Pusta ścieżka — kliknij, aby opisać">
+                            <div className="d-top"><span className="d-tag d-tag-pusta">DO OPISANIA</span></div>
+                            <div className="d-name d-name-pusta">„{k.etykieta}”</div>
+                            <div className="d-zaslepka-hint">kliknij, aby dodać pierwszy krok</div>
+                          </div>
+                        );
+                      }
+                      const otw = k.typ === "bramka" && otwarte.some(o => o.bramkaId === k.id);
+                      return (
+                        <div key={k.id} ref={el => nodeRefs.current[k.id] = el}
+                          className={"d-node " + (k.typ === "bramka" ? "d-bramka" : k.typ === "koniec" ? "d-koniec" : "d-zadanie") + (otw ? " d-otwarty" : "") + (edytowany === k.id ? " d-edytowany" : "")}
+                          onClick={() => onKlik(k)} title={k.typ === "bramka" ? "Bramkę edytujesz przez gałęzie" : "Kliknij, aby edytować"}>
+                          {k.typ !== "bramka" && <button className="x-btn x-node" onClick={(e) => { e.stopPropagation(); onUsun(k.id); }}>×</button>}
+                          <div className="d-top">
+                            <span className="d-num">{numeracja[k.id] || "?"}</span>
+                            {k.typ === "bramka" ? <span className="d-tag d-tag-br">{k.podtyp}</span>
+                              : k.typ === "koniec" ? <span className="d-tag d-tag-end">KONIEC</span>
+                              : <span className="d-tag">{k.stanowisko}{k.tiketowy === false ? " · ukryty" : ""}</span>}
+                          </div>
+                          <div className="d-name">{k.nazwa}</div>
+                          {k.typ === "zadanie" && (k.sla || k.linki?.length > 0 || k.wymagaZdjecia) && (
+                            <div className="d-meta">{k.sla && <span>🕒 {k.sla} {k.slaJedn || "dni"}</span>}{k.linki?.length > 0 && <span>🔗 {k.linki.length}</span>}{k.wymagaZdjecia && <span className="d-foto">📷 dowód</span>}</div>
+                          )}
+                          {/* znacznik: ten krok wraca wstecz (źródło pętli) */}
+                          {przejscia.filter(p => p.petla && p.zrodlo === k.id).map(p => (
+                            <button key={p.id} className="d-petla d-petla-zrodlo" onClick={(e) => { e.stopPropagation(); const t = nodeRefs.current[p.cel]; if (t) { t.scrollIntoView({ behavior: "smooth", block: "center" }); t.classList.add("d-podswietl"); setTimeout(() => t.classList.remove("d-podswietl"), 1500); } }}>
+                              ↩ wraca do: {(kroki.find(x => x.id === p.cel) || {}).nazwa || numeracja[p.cel]}{p.limit ? ` · max ${p.limit}×` : ""}
+                            </button>
+                          ))}
+                          {/* znacznik: ten krok jest punktem powrotu pętli */}
+                          {przejscia.some(p => p.petla && p.cel === k.id) && (
+                            <div className="d-petla d-petla-cel">↩ punkt powrotu pętli</div>
+                          )}
+                        </div>
+                      );
+                    })}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// układ rzędów: sekwencja w dół, WSZYSTKIE gałęzie bramki w jednym rzędzie obok siebie.
+// Puste ścieżki (otwarte wątki bez kroku) dostają wirtualne węzły-zaślepki, by graf
+// pokazywał rozgałęzienie od razu i wyrównywał rodzeństwo (#10, #11).
+function buildUklad(kroki, przejscia, otwarte = []) {
+  // v6: jeden płaski układ rzędów (bez grupowania w etapy).
+  // sekwencja w dół, WSZYSTKIE gałęzie bramki w jednym rzędzie obok siebie.
+  const ke = kroki;
+  if (!ke.length) return [];
+  const byId = Object.fromEntries(ke.map(k => [k.id, k]));
+  // zaślepki dla otwartych ścieżek bramki bez pierwszego kroku
+  const zaslepki = {}; // bramkaId -> [ {id, typ:'zaslepka', etykieta, bramka} ]
+  otwarte.filter(w => byId[w.bramkaId]).forEach(w => {
+    const maRealne = przejscia.some(p => p.zrodlo === w.bramkaId && p.etykieta === w.etykieta && byId[p.cel]);
+    if (!maRealne) {
+      (zaslepki[w.bramkaId] = zaslepki[w.bramkaId] || []).push({ id: "z_" + w.galazId, typ: "zaslepka", nazwa: w.etykieta, etykieta: w.etykieta, bramka: w.bramka });
+    }
+  });
+
+  const rzedy = [];
+  const odwiedzone = new Set();
+  const wejWewn = id => przejscia.some(p => p.cel === id && byId[p.zrodlo]);
+  let start = ke.find(k => !wejWewn(k.id)) || ke[0];
+
+  let kolejka = [start];
+  while (kolejka.length) {
+    kolejka = kolejka.filter(k => k && !odwiedzone.has(k.id));
+    if (!kolejka.length) break;
+    kolejka.forEach(k => odwiedzone.add(k.id));
+    rzedy.push(kolejka);
+    const nast = [];
+    kolejka.forEach(k => {
+      przejscia.filter(p => p.zrodlo === k.id && byId[p.cel]).forEach(p => {
+        if (!odwiedzone.has(p.cel) && !nast.find(x => x.id === p.cel)) nast.push(byId[p.cel]);
+      });
+      if (zaslepki[k.id]) zaslepki[k.id].forEach(z => { if (!nast.find(x => x.id === z.id)) nast.push(z); });
+    });
+    kolejka = nast;
+  }
+  ke.forEach(k => { if (!odwiedzone.has(k.id)) rzedy.push([k]); });
+  return rzedy;
+}
+
+function buildNumeracja(kroki, przejscia) {
+  // numeracja sekwencyjna z gałęziami (v6, bez etapów):
+  // ciąg główny 1,2,3...; gałąź bramki dostaje literę przy numerze bramki (2a,2b);
+  // kolejne kroki w gałęzi: 2a.1, 2a.2
+  const num = {};
+  let lic = 0;
+  kroki.forEach(k => {
+    const wej = przejscia.find(p => p.cel === k.id && p.bramka);
+    if (wej) {
+      const bn = num[wej.zrodlo] || "?";
+      const rodz = przejscia.filter(p => p.zrodlo === wej.zrodlo);
+      const idx = rodz.findIndex(p => p.cel === k.id);
+      num[k.id] = `${bn}${String.fromCharCode(97 + Math.max(0, idx))}`;
+    } else {
+      // krok w gałęzi (wejście nie-bramkowe ze źródła mającego numer literowy)?
+      const wejSeq = przejscia.find(p => p.cel === k.id && !p.bramka && !p.petla);
+      const src = wejSeq && num[wejSeq.zrodlo];
+      if (src && /[a-z]/.test(src)) {
+        // kontynuacja gałęzi: dolicz .N
+        const baza = src.replace(/\.(\d+)$/, "");
+        const ile = Object.values(num).filter(v => v.startsWith(baza + ".")).length;
+        num[k.id] = `${baza}.${ile + 1}`;
+      } else { lic++; num[k.id] = `${lic}`; }
+    }
+  });
+  return num;
+}
+
+function waliduj(kroki, przejscia, otwarte) {
+  const p = [];
+  if (kroki.length === 0) return { ok: false, problemy: ["Brak kroków."] };
+  if (otwarte.length) p.push(`${otwarte.length} otwartych ścieżek do domknięcia.`);
+  if (!kroki.some(k => k.typ === "koniec")) p.push("Brak kroku końcowego (finalny produkt).");
+  kroki.forEach(k => { if (k.typ === "bramka" && przejscia.filter(x => x.zrodlo === k.id).length < 2) p.push(`Bramka „${k.nazwa}” ma < 2 wyjścia.`); });
+  kroki.filter(k => k.typ === "zadanie" && k.stanowisko === "Nieprzypisane").forEach(k => p.push(`„${k.nazwa}” bez stanowiska.`));
+  return { ok: p.length === 0, problemy: p };
+}
+
+// "Zbadaj proces" — poziom 1 (błędy) + poziom 2 (sygnały heurystyczne)
+function analizujProces(kroki, przejscia, otwarte, numeracja, stanowiska) {
+  const bledy = [];
+  const sygnaly = [];
+  const zadania = kroki.filter(k => k.typ === "zadanie" || k.typ === "koniec");
+
+  // --- POZIOM 1: struktura ---
+  if (otwarte.length) bledy.push(`${otwarte.length} ścieżek nie jest domkniętych — każda musi prowadzić do końca, zejścia lub innego kroku.`);
+  if (!kroki.some(k => k.typ === "koniec")) bledy.push("Proces nie ma żadnego kroku końcowego.");
+  kroki.forEach(k => {
+    if (k.typ === "bramka") {
+      const wy = przejscia.filter(x => x.zrodlo === k.id);
+      if (wy.length < 2) bledy.push(`Bramka ${numeracja[k.id]} „${k.nazwa}” ma mniej niż 2 wyjścia.`);
+    }
+  });
+  zadania.filter(k => k.stanowisko === "Nieprzypisane").forEach(k => bledy.push(`Krok ${numeracja[k.id]} „${k.nazwa}” nie ma przypisanego stanowiska.`));
+  kroki.filter(k => k.tiketowy === false && k.wymagaZdjecia).forEach(k => bledy.push(`Krok ${numeracja[k.id]} „${k.nazwa}”: wymaga zdjęcia-dowodu, ale jest niewidoczny dla pracownika — nie ma kto zrobić zdjęcia. Wyłącz dowód albo włącz „Zadanie dla pracownika”.`));
+  // kroki osierocone (poza pierwszym): brak wejścia
+  kroki.forEach(k => {
+    const maWej = przejscia.some(p => p.cel === k.id);
+    const maWy = przejscia.some(p => p.zrodlo === k.id);
+    if (!maWej && !maWy && kroki.length > 1) bledy.push(`Krok ${numeracja[k.id]} „${k.nazwa}” jest oderwany — nic do niego nie prowadzi i nic z niego nie wychodzi.`);
+  });
+
+  // --- POZIOM 2: sygnały sensowności (3 przykładowe reguły) ---
+  // 1) brak SLA
+  const bezSla = zadania.filter(k => !k.sla);
+  if (bezSla.length) sygnaly.push(`${bezSla.length} kroków nie ma określonego czasu (SLA) — bez tego nie policzysz terminów zlecenia.`);
+  // 2) wąskie gardło: jedno stanowisko na większości kroków
+  const licznik = {};
+  zadania.forEach(k => { licznik[k.stanowisko] = (licznik[k.stanowisko] || 0) + 1; });
+  const max = Object.entries(licznik).sort((a, b) => b[1] - a[1])[0];
+  if (max && zadania.length >= 4 && max[1] / zadania.length > 0.6) sygnaly.push(`Stanowisko „${max[0]}” wykonuje ${max[1]} z ${zadania.length} kroków — możliwe wąskie gardło. Rozważ podział odpowiedzialności.`);
+  // 3) długi proces bez decyzji
+  const maBramke = kroki.some(k => k.typ === "bramka");
+  if (zadania.length >= 8 && !maBramke) sygnaly.push(`Proces ma ${zadania.length} kroków i żadnego punktu decyzyjnego — czy na pewno nigdzie nic się nie rozgałęzia ani nie wymaga sprawdzenia?`);
+
+  // --- PĘTLE (sekcja 4.4) ---
+  const petle = przejscia.filter(p => p.petla);
+  petle.forEach(p => {
+    // cel musi istnieć
+    if (!kroki.some(k => k.id === p.cel)) {
+      bledy.push(`Pętla z kroku ${numeracja[p.zrodlo] || "?"} wraca do nieistniejącego kroku.`);
+      return;
+    }
+    // źródło pętli powinno wychodzić z gałęzi decyzji (XOR): krok-źródło ma wejście od bramki XOR
+    const zrodloMaWejscieZXor = przejscia.some(x => x.cel === p.zrodlo && x.bramka === "XOR")
+      || kroki.some(k => k.typ === "bramka" && k.podtyp === "XOR" && przejscia.some(x => x.zrodlo === k.id));
+    if (!zrodloMaWejscieZXor) {
+      bledy.push(`Pętla z kroku ${numeracja[p.zrodlo] || "?"} nie wychodzi z decyzji (XOR) — brak warunku wyjścia, pętla może być nieskończona.`);
+    }
+    // bez limitu — sygnał
+    if (!p.limit) {
+      sygnaly.push(`Pętla wracająca do ${numeracja[p.cel] || "kroku"} nie ma ustawionego limitu powtórzeń — rozważ limit, by uniknąć nieskończonego powtarzania.`);
+    }
+  });
+
+  return { bledy, sygnaly };
+}
+
+const styles = {
+  app: { minHeight: "100vh", background: "#16161a", color: "#e2e8f0", fontFamily: "'Montserrat', system-ui, sans-serif", padding: 24 },
+  header: { display: "flex", justifyContent: "space-between", alignItems: "flex-end", borderBottom: "1px solid #33333a", paddingBottom: 18, marginBottom: 24, maxWidth: 1320, margin: "0 auto 24px" },
+  h1: { fontSize: 26, fontWeight: 800, color: "#fff", margin: 0 },
+  statusBox: { display: "flex", gap: 12, alignItems: "center", fontSize: 12, color: "#94a3b8", background: "#1f1f24", border: "1px solid #33333a", padding: "8px 14px", borderRadius: 8 },
+  grid: { display: "grid", gridTemplateColumns: "minmax(380px, 5fr) 7fr", gap: 24, maxWidth: 1320, margin: "0 auto", alignItems: "start" },
+  panel: { background: "#1f1f24", border: "1px solid #33333a", borderRadius: 14, padding: 20, position: "sticky", top: 24 },
+  canvas: { background: "#1f1f24", border: "1px solid #33333a", borderRadius: 14, padding: 20, minHeight: 640 },
+  panelTitle: { fontSize: 13, fontWeight: 700, color: "#cbd5e1", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 16, paddingBottom: 10, borderBottom: "1px solid #33333a", display: "flex", justifyContent: "space-between", alignItems: "center" },
+};
+
+const css = `
+@import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800&display=swap');
+* { font-family: 'Montserrat', system-ui, sans-serif; }
+.login-wrap { max-width: 1320px; margin: 70px auto; display: flex; justify-content: center; }
+.login-card { background: #1f1f24; border: 1px solid #33333a; border-radius: 16px; padding: 36px; width: 380px; }
+.logo-big { font-size: 34px; font-weight: 800; letter-spacing: 0.04em; background: linear-gradient(90deg,#d99a4e,#c2873f); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.haslo { font-size: 14px; color: #94a3b8; margin: 2px 0 18px; letter-spacing: 0.02em; }
+.logo-sm { font-size: 11px; letter-spacing: 0.12em; color: #d99a4e; font-weight: 800; text-transform: uppercase; margin-bottom: 4px; }
+.login-info { font-size: 13px; color: #64748b; margin-bottom: 20px; line-height: 1.5; }
+.stan-panel { background: #1f1f24; border: 1px solid #33333a; border-radius: 14px; padding: 22px; width: 92%; max-width: 520px; margin: auto; max-height: 80vh; overflow-y: auto; }
+.stan-panel-head { display: flex; justify-content: space-between; align-items: center; font-size: 16px; font-weight: 700; color: #fff; margin-bottom: 8px; }
+.stan-opis { font-size: 12px; color: #94908a; line-height: 1.5; margin-bottom: 16px; }
+.stan-wiersz { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-top: 1px solid #2a2a30; }
+.stan-nazwa { font-size: 14px; color: #fff; font-weight: 600; }
+.stan-godz { display: flex; align-items: center; gap: 6px; }
+.stan-godz input { background: #16161a; border: 1px solid #33333a; border-radius: 7px; padding: 6px 8px; color: #fff; font-size: 13px; }
+.stan-godz span { color: #6b6760; }
+.stan-info { font-size: 11px; color: #8a7340; background: #221b10; border: 1px solid #3a2a14; border-radius: 8px; padding: 10px; margin-top: 14px; line-height: 1.4; }
+.m-modal-tlo { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 50; }
+.bez-podpowiedzi [data-tip]:hover::after, .bez-podpowiedzi [data-tip]:hover::before { display: none !important; }
+.dol-pasek { max-width: 1320px; margin: 16px auto 0; display: flex; justify-content: flex-end; }
+.podp-suwak { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
+.podp-suwak input { display: none; }
+.podp-track { width: 36px; height: 20px; background: #33333a; border-radius: 10px; position: relative; transition: background 0.2s; }
+.podp-galka { position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #94908a; transition: all 0.2s; }
+.podp-suwak input:checked + .podp-track { background: #c2873f; }
+.podp-suwak input:checked + .podp-track .podp-galka { left: 18px; background: #fff; }
+.podp-label { font-size: 12px; color: #94908a; }
+.stopka { text-align: center; font-size: 12px; color: #475569; margin: 32px auto 8px; max-width: 1320px; letter-spacing: 0.03em; }
+.krok-kreatora { animation: fade 0.3s ease; }
+@keyframes fade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.krok-pytanie { font-size: 18px; font-weight: 700; color: #fff; margin-bottom: 6px; }
+.krok-podpowiedz { font-size: 12px; color: #64748b; line-height: 1.5; margin-bottom: 16px; }
+.krok-pola { display: flex; flex-direction: column; gap: 10px; }
+.lbl { font-size: 11px; font-weight: 600; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.04em; margin-top: 6px; display: block; }
+.hint { color: #475569; text-transform: none; font-weight: 400; }
+.inp { width: 100%; box-sizing: border-box; background: #16161a; border: 1px solid #33333a; border-radius: 8px; padding: 10px 12px; color: #fff; font-size: 14px; outline: none; transition: border 0.15s; }
+.inp:focus { border-color: #c2873f; }
+.inp-sm { padding: 7px 10px; font-size: 13px; }
+.sla-row { display: flex; gap: 8px; align-items: center; }
+.jedn-toggle { display: flex; border: 1px solid #33333a; border-radius: 8px; overflow: hidden; }
+.jedn-toggle button { background: #16161a; border: none; color: #64748b; padding: 9px 12px; font-size: 13px; cursor: pointer; }
+.jedn-toggle .jedn-on { background: #c2873f; color: #fff; font-weight: 600; }
+.link-row { display: flex; gap: 6px; align-items: center; }
+.x-btn { background: #33333a; border: none; color: #94a3b8; width: 28px; height: 28px; border-radius: 6px; cursor: pointer; font-size: 16px; line-height: 1; flex: 0 0 auto; transition: all 0.15s; }
+.x-btn:hover:not(:disabled) { background: #7f1d1d; color: #fff; }
+.x-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+.undo, .mini-btn { background: #33333a; border: none; color: #cbd5e1; padding: 5px 10px; border-radius: 6px; font-size: 12px; cursor: pointer; }
+.undo:disabled, .mini-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+.undo:hover:not(:disabled), .mini-btn:hover:not(:disabled) { background: #44444d; }
+.canvas-akcje { display: flex; gap: 6px; }
+.mini-btn { text-transform: none; letter-spacing: 0; font-weight: 600; }
+.btn-primary { background: #c2873f; color: #fff; border: none; border-radius: 8px; padding: 11px; font-size: 14px; font-weight: 700; cursor: pointer; margin-top: 8px; transition: background 0.15s; width: 100%; }
+.btn-primary:hover { background: #d99a4e; }
+.btn-ghost { background: transparent; color: #94a3b8; border: 1px solid #33333a; border-radius: 8px; padding: 9px; font-size: 13px; cursor: pointer; transition: all 0.15s; width: 100%; }
+.btn-ghost:hover { border-color: #475569; color: #cbd5e1; }
+.przel-wrap { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+.przel-btn { display: flex; align-items: center; gap: 10px; background: #16161a; border: 1px solid #33333a; border-radius: 9px; padding: 10px 11px; cursor: pointer; text-align: left; transition: all 0.15s; }
+.przel-lampka { flex: 0 0 auto; width: 16px; height: 16px; border-radius: 50%; background: #33333a; border: 1px solid #44444d; transition: all 0.15s; }
+.przel-txt b { display: block; font-size: 12px; color: #94908a; }
+.przel-txt span { display: block; font-size: 9px; color: #6b6760; margin-top: 1px; }
+.przel-on { border-color: #6b9b6e; background: #161e16; }
+.przel-on .przel-lampka { background: #6b9b6e; border-color: #8fc792; box-shadow: 0 0 6px #6b9b6e88; }
+.przel-on .przel-txt b { color: #9fc7a2; }
+.bib-rodzina { border: 1px solid #33333a; border-radius: 10px; padding: 10px 12px; margin-top: 10px; }
+.bib-nazwa { font-size: 14px; font-weight: 700; color: #e8c98f; margin-bottom: 6px; }
+.bib-wersja { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 5px 0; border-top: 1px dashed #2a2a30; flex-wrap: wrap; }
+.bib-status { font-size: 12px; color: #94908a; }
+.bib-pub { color: #9fc7a2; } .bib-szkic { color: #e8a04e; } .bib-wyc { color: #94908a; } .bib-arch { color: #6b6760; }
+.bib-akcje { display: flex; gap: 6px; align-items: center; }
+.btn-sm { padding: 5px 9px !important; font-size: 11px !important; }
+.bib-hint { font-size: 10px; color: #6b6760; font-style: italic; }
+.bib-stopka { margin-top: 14px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.proc-status { font-size: 11px; padding: 5px 10px; border-radius: 8px; }
+.proc-pub { color: #9fc7a2; background: #161e16; border: 1px solid #3d5a3f; }
+.proc-publikuj:not(:disabled) { color: #9fc7a2 !important; border-color: #3d5a3f !important; }
+.proc-publikuj:disabled { opacity: 0.4; cursor: not-allowed; }
+.przel-blok { opacity: 0.45; cursor: not-allowed; }
+.tk-foto-blok { opacity: 0.35; cursor: not-allowed; }
+.przel-on-foto { border-color: #c2873f; background: #1e1810; }
+.przel-on-foto .przel-lampka { background: #c2873f; border-color: #d99a4e; box-shadow: 0 0 6px #c2873f88; }
+.przel-on-foto .przel-txt b { color: #e8c98f; }
+.d-foto { color: #d99a4e !important; }
+.d-petla { display: block; margin-top: 7px; font-size: 10px; border-radius: 6px; padding: 4px 8px; width: 100%; text-align: left; }
+.d-petla-zrodlo { background: #2a1f10; color: #e8c98f; border: 1px solid #5c3f1d; cursor: pointer; font-weight: 600; }
+.d-petla-zrodlo:hover { background: #3a2a14; }
+.d-petla-cel { background: #1a2230; color: #8fb3d9; border: 1px solid #2d4a6b; font-style: italic; }
+.d-podswietl { outline: 3px solid #c2873f !important; outline-offset: 2px; transition: outline 0.2s; }
+.btn-cont { background: #2a3a2a; color: #9fc7a2; border: 1px solid #3d5a3f; border-radius: 8px; padding: 10px; font-size: 13px; font-weight: 600; cursor: pointer; width: 100%; }
+.btn-cont:hover { background: #34492f; color: #b8d9ba; }
+.d-zaslepka { border: 1px dashed #c2873f; background: #1f1a13; opacity: 0.92; cursor: pointer; transition: all 0.15s; }
+.d-zaslepka:hover { background: #c2873f26; opacity: 1; border-color: #d99a4e; }
+.d-tag-pusta { color: #d99a4e; border-color: #8a5e2b; }
+.d-name-pusta { color: #e8c98f; }
+.d-zaslepka-hint { font-size: 10px; color: #9a7340; margin-top: 6px; font-style: italic; }
+.btn-warn:hover { background: #d97706; }
+.btn-danger { background: transparent; color: #f87171; border: 1px solid #7f1d1d; border-radius: 8px; padding: 9px; font-size: 13px; cursor: pointer; width: 100%; }
+.btn-danger:hover { background: #7f1d1d; color: #fff; }
+.edycja-akcje { display: flex; flex-direction: column; gap: 7px; margin-top: 10px; border-top: 1px solid #33333a; padding-top: 12px; }
+[data-tip] { position: relative; }
+[data-tip]:hover::after { content: attr(data-tip); position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%); background: #0d0d10; color: #e2e0db; border: 1px solid #5c3f1d; border-radius: 8px; padding: 7px 11px; font-size: 11px; font-weight: 500; line-height: 1.4; white-space: normal; width: max-content; max-width: 240px; z-index: 100; box-shadow: 0 6px 20px rgba(0,0,0,0.5); pointer-events: none; }
+[data-tip]:hover::before { content: ""; position: absolute; bottom: calc(100% + 2px); left: 50%; transform: translateX(-50%); border: 6px solid transparent; border-top-color: #5c3f1d; z-index: 100; pointer-events: none; }
+.radio { display: flex; gap: 10px; align-items: flex-start; padding: 12px; border: 1px solid #33333a; border-radius: 10px; cursor: pointer; transition: all 0.15s; }
+.radio-on { border-color: #c2873f; background: #3a2a1433; }
+.radio input { margin-top: 3px; accent-color: #c2873f; }
+.radio-label { font-size: 14px; font-weight: 600; color: #e2e8f0; }
+.radio-opis { font-size: 12px; color: #64748b; margin-top: 2px; line-height: 1.4; }
+.galezie { background: #16161a; border: 1px solid #33333a; border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+.podpowiedz-soft { font-size: 11px; color: #93c5fd; background: #0c2a4d; border: 1px solid #1e40af; border-radius: 8px; padding: 8px 10px; line-height: 1.45; }
+.polacz-box { background: #16161a; border: 1px solid #33333a; border-radius: 10px; padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+.biezacy-watek { background: #3a2a14; border: 1px solid #7a5526; color: #f0dcb0; font-size: 12px; padding: 8px 12px; border-radius: 8px; margin-bottom: 14px; }
+.info { font-size: 12px; color: #93c5fd; line-height: 1.5; border-top: 1px solid #33333a; padding-top: 12px; margin-top: 4px; }
+.pusto { color: #475569; font-size: 14px; text-align: center; padding: 100px 20px; }
+.wybor-galaz { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; background: #3a2a1444; border: 1px solid #8a5e2b; border-radius: 10px; padding: 13px 14px; margin-bottom: 8px; cursor: pointer; transition: all 0.15s; }
+.wybor-galaz:hover { background: #5c3f1d; border-color: #c2873f; }
+.wg-bramka { font-family: monospace; font-size: 11px; color: #e2cfa0; font-weight: 700; }
+.wg-etyk { flex: 1; font-size: 14px; color: #fff; font-weight: 600; }
+.wg-stan { font-size: 10px; padding: 2px 8px; border-radius: 10px; font-weight: 600; }
+.stan-pusta { background: #33333a; color: #94a3b8; }
+.stan-wtrakcie { background: #422006; color: #fbbf24; }
+.stan-domknieta { background: #26331f; color: #9fc7a2; }
+.rejestr { margin-top: 18px; border-top: 1px solid #33333a; padding-top: 14px; }
+.rejestr-head { font-size: 12px; font-weight: 700; color: #fbbf24; margin-bottom: 10px; }
+.rejestr-item { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; background: #422006; border: 1px solid #78350f; border-radius: 8px; padding: 9px 12px; margin-bottom: 6px; cursor: pointer; transition: all 0.15s; }
+.rejestr-item:hover { background: #573009; border-color: #b45309; }
+.rejestr-aktywny { border-color: #b08442; background: #3a2a14; }
+.rejestr-bramka { font-family: monospace; font-size: 11px; color: #e8c98f; font-weight: 700; }
+.rejestr-etykieta { flex: 1; font-size: 13px; color: #fed7aa; }
+/* DIAGRAM */
+.widok-przel { display: inline-flex; border: 1px solid #33333a; border-radius: 8px; overflow: hidden; margin-right: 4px; }
+.widok-przel button { background: #1f1f24; color: #94908a; border: none; padding: 7px 13px; font-size: 12px; font-weight: 600; cursor: pointer; }
+.widok-przel button:disabled { opacity: 0.4; cursor: not-allowed; }
+.widok-przel .wp-on { background: #c2873f; color: #fff; }
+.tabela-krokow { display: flex; flex-direction: column; gap: 4px; }
+.tk-info { font-size: 11px; color: #8a7340; background: #221b10; border: 1px solid #3a2a14; border-radius: 8px; padding: 9px 11px; margin-bottom: 8px; line-height: 1.4; }
+.tk-naglowek, .tk-wiersz { display: grid; grid-template-columns: 56px 1fr 130px 150px 120px; gap: 8px; align-items: center; }
+.tk-naglowek { font-size: 10px; font-weight: 700; color: #6b6760; text-transform: uppercase; letter-spacing: 0.04em; padding: 4px 8px; }
+.tk-wiersz { background: #16161a; border: 1px solid #2a2a30; border-radius: 8px; padding: 7px 8px; }
+.tk-nr { font-family: monospace; font-size: 11px; color: #c2873f; font-weight: 700; }
+.tk-inp { background: #1f1f24; border: 1px solid #33333a; border-radius: 6px; padding: 7px 8px; color: #fff; font-size: 13px; outline: none; width: 100%; }
+.tk-inp:focus { border-color: #c2873f; }
+.tk-tnt { width: 100%; border: 1px solid #33333a; border-radius: 6px; padding: 7px; font-size: 12px; font-weight: 700; cursor: pointer; }
+.tk-t { background: #1c241c; color: #9fc7a2; border-color: #3d5a3f; }
+.tk-nt { background: #25252a; color: #cbc6be; border-color: #555049; }
+.tk-sla-wrap { display: flex; gap: 4px; }
+.tk-sla { width: 56px !important; }
+.tk-c-tnt { display: flex; gap: 4px; align-items: center; }
+.tk-foto { background: #1f1f24; border: 1px solid #33333a; border-radius: 6px; padding: 4px 6px; font-size: 12px; cursor: pointer; opacity: 0.4; }
+.tk-foto-on { opacity: 1; border-color: #c2873f; background: #1e1810; }
+.tk-jedn { background: #1f1f24; border: 1px solid #33333a; border-radius: 6px; color: #d99a4e; font-size: 11px; padding: 0 8px; cursor: pointer; font-weight: 600; }
+.diagram { position: relative; }
+.diagram-svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 0; overflow: visible; }
+.edge-label { font-size: 9px; font-family: monospace; text-align: center; color: #e8c98f; background: #1f1f24; border: 1px solid #7a5526; border-radius: 4px; padding: 1px 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.diagram-tresc { position: relative; z-index: 1; display: flex; flex-direction: column; gap: 22px; }
+.d-body { display: flex; flex-direction: column; align-items: center; gap: 30px; padding: 26px 16px; }
+.d-rzad { display: flex; justify-content: center; gap: 28px; flex-wrap: wrap; }
+.d-node { position: relative; background: #16161a; border: 1px solid #33333a; border-radius: 10px; padding: 12px; width: 220px; cursor: pointer; transition: all 0.15s; }
+.d-node:hover { border-color: #c2873f; transform: translateY(-1px); }
+.d-zadanie:hover { box-shadow: 0 4px 16px #c2873f33; }
+.d-bramka { border-color: #b08442; border-style: dashed; background: #1e1a14; cursor: default; }
+.d-koniec { border-color: #6b9b6e; background: #181d17; }
+.d-otwarty { box-shadow: 0 0 0 2px #f59e0b88; border-color: #f59e0b; }
+.d-edytowany { box-shadow: 0 0 0 2px #c2873f; border-color: #c2873f; }
+.x-node { position: absolute; top: 6px; right: 6px; width: 22px; height: 22px; font-size: 14px; opacity: 0; }
+.d-node:hover .x-node { opacity: 1; }
+.d-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; padding-right: 22px; }
+.d-num { font-size: 11px; font-family: monospace; color: #d99a4e; font-weight: 700; }
+.d-tag { font-size: 9px; background: #1f1f24; border: 1px solid #33333a; color: #94a3b8; padding: 2px 6px; border-radius: 4px; text-transform: uppercase; letter-spacing: 0.03em; }
+.d-tag-br { color: #e8c98f; border-color: #7a5526; }
+.d-tag-end { color: #9fc7a2; border-color: #5a8a5d; }
+.d-name { font-size: 13px; font-weight: 700; color: #fff; line-height: 1.3; }
+.d-meta { display: flex; gap: 10px; margin-top: 8px; font-size: 10px; color: #64748b; font-family: monospace; }
+.walid { border-radius: 10px; padding: 14px; margin-top: 22px; }
+.walid-ok { background: #26331f22; border: 1px solid #5a8a5d; }
+.walid-warn { background: #422006; border: 1px solid #78350f; }
+.walid-head { font-size: 13px; font-weight: 700; margin-bottom: 8px; color: #fff; }
+.walid-item { font-size: 12px; color: #fcd34d; line-height: 1.6; }
+.walid-ok .walid-head { color: #9fc7a2; }
+/* RAPORT */
+.raport { margin-top: 22px; border: 1px solid #44444d; border-radius: 12px; overflow: hidden; }
+.raport-head { display: flex; justify-content: space-between; align-items: center; background: #33333a; padding: 12px 16px; font-size: 14px; font-weight: 700; color: #fff; }
+.raport-sekcja { padding: 14px 16px; border-top: 1px solid #33333a; }
+.raport-tytul { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 8px; }
+.raport-blad { color: #f87171; }
+.raport-sygnal { color: #fbbf24; }
+.raport-disc { font-size: 11px; color: #64748b; margin-bottom: 8px; font-style: italic; }
+.raport-item { font-size: 12px; line-height: 1.6; padding: 4px 0; }
+.raport-item-blad { color: #fca5a5; }
+.raport-item-sygnal { color: #fcd34d; }
+.raport-ok { font-size: 12px; color: #9fc7a2; }
+`;
+
+return WorkflyApp;
+})();
+
+const ModUruchomienie = (function() {
+// ============================================================
+// WORKFLY — uruchomienie zlecenia (szeroki ekran, dla właściciela).
+// Kreator: wybór procesu → dane zlecenia (auto-numer) → podgląd
+// tiketów (T / NT / warunkowy) → przypisanie osób (opcjonalne)
+// → uruchom → potwierdzenie z listą utworzonych tiketów.
+// PROTOTYP — bez zapisu. Dane: proces serwisowy Loxone.
+// ============================================================
+
+// słownik stanowisk + pracownicy (edytowalny byt organizacji)
+const PRACOWNICY = {
+  'Klient': [], // NT — nie przypisujemy
+  'Serwisant': ['Michał C.', 'Adam W.'],
+  'Koordynator': ['Tomek L.'],
+  'COO': ['Justyna K.'],
+};
+
+// definicja procesu Loxone (uproszczona, z cechą T/NT i bramką XOR)
+const PROCES = {
+  nazwa: 'Serwis awarii Loxone',
+  kroki: [
+    { nr: '1', nazwa: 'Zgłoszenie awarii przez klienta', stanowisko: 'Klient', tiketowy: false, sla: '4', jedn: 'godz' },
+    { nr: '2', nazwa: 'Decyzja: zgoda na dostęp zdalny?', bramka: 'XOR' },
+    { nr: '2a', nazwa: 'Diagnoza zdalna i AI Triage', stanowisko: 'Serwisant', tiketowy: true, sla: '2', jedn: 'godz', warunkowy: true, gałąź: 'zgoda' },
+    { nr: '2a.1', nazwa: 'Naprawa zdalna systemu', stanowisko: 'Serwisant', tiketowy: true, sla: '4', jedn: 'godz', warunkowy: true, gałąź: 'zgoda', wymagaDowodu: true },
+    { nr: '2b', nazwa: 'Wstrzymanie obsługi', stanowisko: 'Koordynator', tiketowy: true, sla: '1', jedn: 'dni', warunkowy: true, gałąź: 'brak zgody' },
+    { nr: '3', nazwa: 'Zamknięcie ticketu i fakturowanie', stanowisko: 'COO', tiketowy: true, sla: '1', jedn: 'dni' },
+  ],
+};
+
+function UruchomienieZlecenia() {
+  const baza = useBaza();
+  const opublikowane = baza.procesy.filter(p => p.status === 'opublikowany');
+  const [wybranyId, setWybranyId] = useState(null);
+  const [noweZlecenie, setNoweZlecenie] = useState(null); // wynik realnego uruchomienia
+  const wybranyProc = opublikowane.find(p => p.id === wybranyId) || null;
+  const [krok, setKrok] = useState(1); // 1..5 + 6=potwierdzenie
+  const [podpowiedzi, setPodpowiedzi] = useState(true);
+  const OPISY_KROKOW = ['Wybierz proces, z którego powstanie zlecenie', 'Wpisz dane klienta i zlecenia (numer, data, priorytet)', 'Zobacz, jakie tikety powstaną, i podepnij dokumenty do zadań', 'Przypisz osoby do stanowisk (opcjonalnie — można później)'];
+  const [klient, setKlient] = useState('');
+  const nrZlecenia = noweZlecenie ? noweZlecenie.nr : 'ZLEC-2026-0xx (nada system)'; // auto
+  const [dataStart, setDataStart] = useState('2026-06-04');
+  const [priorytet, setPriorytet] = useState('normalny');
+  const [wartosc, setWartosc] = useState('');
+  const [pm, setPm] = useState('');
+  const [przypisania, setPrzypisania] = useState({}); // stanowisko -> osoba
+  const [uruchomione, setUruchomione] = useState(false);
+  const [dokTiketu, setDokTiketu] = useState({}); // nrKroku -> [{nazwa, url}] dokumenty specyficzne dla tiketu
+  const [edycjaDok, setEdycjaDok] = useState(null); // nr kroku, do którego dodajemy dokument
+  const [dNazwa, setDNazwa] = useState('');
+  const [dUrl, setDUrl] = useState('');
+
+  // adapter: kroki z magazynu -> widok (numeracja, bramka, warunkowy)
+  const WIDOK = useMemo(() => {
+    if (!wybranyProc) return { nazwa: PROCES.nazwa, wersja: 1, kroki: PROCES.kroki };
+    const num = {}; let lic = 0;
+    wybranyProc.kroki.forEach(k => {
+      const wejB = wybranyProc.przejscia.find(p => p.cel === k.id && p.bramka);
+      if (wejB) { const rodz = wybranyProc.przejscia.filter(p => p.zrodlo === wejB.zrodlo); const idx = rodz.findIndex(p => p.cel === k.id); num[k.id] = (num[wejB.zrodlo] || '?') + String.fromCharCode(97 + Math.max(0, idx)); }
+      else { lic++; num[k.id] = String(lic); }
+    });
+    const kroki = wybranyProc.kroki.map(k => ({
+      nr: num[k.id] || '?', nazwa: k.nazwa, stanowisko: k.stanowisko,
+      tiketowy: k.typ !== 'bramka' && k.tiketowy !== false,
+      bramka: k.typ === 'bramka' ? (k.podtyp || 'XOR') : null,
+      warunkowy: wybranyProc.przejscia.some(p => p.cel === k.id && p.bramka === 'XOR'),
+      wymagaDowodu: !!k.wymagaZdjecia, sla: k.sla, jedn: k.slaJedn || 'dni',
+    }));
+    return { nazwa: wybranyProc.nazwa, wersja: wybranyProc.wersja, kroki };
+  }, [wybranyProc]);
+  const krokiTiketowe = useMemo(() => WIDOK.kroki.filter(k => k.tiketowy), [WIDOK]);
+  const stanowiskaDoObsady = useMemo(() => {
+    const set = [...new Set(krokiTiketowe.map(k => k.stanowisko))];
+    return set;
+  }, [krokiTiketowe]);
+
+  function przypisz(stanowisko, osoba) { setPrzypisania(p => ({ ...p, [stanowisko]: osoba })); }
+  function dodajDokument(nr) {
+    if (!dNazwa.trim()) return;
+    setDokTiketu(d => ({ ...d, [nr]: [...(d[nr] || []), { nazwa: dNazwa.trim(), url: dUrl.trim() || '#' }] }));
+    setDNazwa(''); setDUrl(''); setEdycjaDok(null);
+  }
+  function usunDokument(nr, i) { setDokTiketu(d => ({ ...d, [nr]: (d[nr] || []).filter((_, idx) => idx !== i) })); }
+  function uruchom() {
+    if (wybranyProc) {
+      const z = uruchomZlecenie(wybranyProc, { klient, dataStart, priorytet, wartosc, pm, przypisania, dokTiketu });
+      setNoweZlecenie(z);
+    }
+    setUruchomione(true); setKrok(5);
+  }
+
+  const mozeDalej = krok === 1 ? true : krok === 2 ? klient.trim() !== '' : true;
+
+  return (
+    <div style={styles.app} className={podpowiedzi ? "" : "bez-podpowiedzi"}>
+      <style>{css}</style>
+      <header style={styles.header}>
+        <div><div className="logo">WORKFLY</div><div className="podtytul">Uruchomienie zlecenia</div></div>
+        <div className="kroki-wskaznik">
+          {['Proces', 'Dane', 'Podgląd + dokumenty', 'Przypisanie'].map((nazwa, i) => (
+            <div key={i} className={"krok-pkt" + (krok === i + 1 ? ' aktywny' : krok > i + 1 ? ' zrobiony' : '')} data-tip={podpowiedzi ? OPISY_KROKOW[i] : undefined}>
+              <span className="krok-num">{krok > i + 1 ? '✓' : i + 1}</span>{nazwa}
+            </div>
+          ))}
+        </div>
+      </header>
+
+      <div style={styles.tresc}>
+        {/* KROK 1 — wybór procesu */}
+        {krok === 1 && (
+          <div className="panel">
+            <h2>Wybierz proces do uruchomienia</h2>
+            <p className="opis">Z procesu powstanie zlecenie — konkretna realizacja dla klienta, z własnymi tiketami i terminami.</p>
+            {opublikowane.length === 0 && (
+              <div className="proces-karta wygaszona">Brak opublikowanych procesów w bazie. Przejdź do modułu „Modelowanie", zbuduj proces i kliknij „Opublikuj" — pojawi się tutaj.<br/><span style={{fontSize:11,opacity:0.7}}>Poniżej demo (Loxone) — uruchomienie z demo nie zapisze się do bazy.</span></div>
+            )}
+            {opublikowane.map(p => (
+              <div key={p.id} className={"proces-karta" + (wybranyId === p.id ? " wybrana" : "")} onClick={() => setWybranyId(p.id)} style={{cursor:'pointer'}}>
+                <div className="proces-nazwa">{p.nazwa}</div>
+                <div className="proces-meta">{p.kroki.length} kroków · wersja {p.wersja} · opublikowany</div>
+              </div>
+            ))}
+            {opublikowane.length === 0 && (
+              <div className={"proces-karta" + (wybranyId === '__demo__' ? " wybrana" : "")} onClick={() => setWybranyId('__demo__')} style={{cursor:'pointer'}}>
+                <div className="proces-nazwa">{PROCES.nazwa} <span style={{fontSize:11,opacity:0.6}}>(demo)</span></div>
+                <div className="proces-meta">{PROCES.kroki.length} kroków · wersja 1</div>
+              </div>
+            )}
+            <button className="btn-primary" disabled={!wybranyId} onClick={() => setKrok(2)}>Dalej →</button>
+          </div>
+        )}
+
+        {/* KROK 2 — dane zlecenia */}
+        {krok === 2 && (
+          <div className="panel">
+            <h2>Dane zlecenia</h2>
+            <div className="form-grid">
+              <div className="pole szer2">
+                <label>Klient *</label>
+                <input value={klient} onChange={e => setKlient(e.target.value)} placeholder="np. Kowalski / dom Sopot" autoFocus />
+              </div>
+              <div className="pole">
+                <label>Numer zlecenia <span className="hint">(nadany automatycznie)</span></label>
+                <input value={nrZlecenia} disabled className="disabled" data-tip="Numer nadawany automatycznie przez system — można go nadpisać w realnej aplikacji" />
+              </div>
+              <div className="pole">
+                <label>Data startu</label>
+                <input type="date" value={dataStart} onChange={e => setDataStart(e.target.value)} />
+              </div>
+              <div className="pole">
+                <label>Priorytet</label>
+                <select value={priorytet} onChange={e => setPriorytet(e.target.value)}>
+                  <option value="niski">Niski</option>
+                  <option value="normalny">Normalny</option>
+                  <option value="wysoki">Wysoki</option>
+                  <option value="krytyczny">Krytyczny</option>
+                </select>
+              </div>
+              <div className="pole">
+                <label>Wartość (opcjonalnie)</label>
+                <input value={wartosc} onChange={e => setWartosc(e.target.value)} placeholder="np. 4 500 zł" />
+              </div>
+              <div className="pole szer2">
+                <label>Opiekun zlecenia (PM)</label>
+                <input value={pm} onChange={e => setPm(e.target.value)} placeholder="np. Tomek L." />
+              </div>
+            </div>
+            <div className="nawigacja">
+              <button className="btn-ghost" onClick={() => setKrok(1)}>← Wstecz</button>
+              <button className="btn-primary" disabled={!klient.trim()} onClick={() => setKrok(3)}>Dalej →</button>
+            </div>
+          </div>
+        )}
+
+        {/* KROK 3 — podgląd tiketów */}
+        {krok === 3 && (
+          <div className="panel">
+            <h2>Podgląd: co powstanie z tego zlecenia</h2>
+            <p className="opis">System utworzy tiket z każdego kroku-zadania. T — widoczny dla pracownika; NT — niewidoczny dla pracownika (zdarzenie zewnętrzne odhacza zarządzający na kokpicie). Tu możesz podpiąć dokumenty specyficzne dla tego zlecenia do konkretnych tiketów (linki — plany, materiały od klienta). Do tiketów warunkowych dokumenty podepniesz, gdy ścieżka się ziści (z kokpitu).</p>
+            <div className="legenda">
+              <span className="lg lg-t">T — tiket dla pracownika</span>
+              <span className="lg lg-nt">NT — tiket niewidoczny dla pracownika (odhacza zarządzający)</span>
+              <span className="lg lg-war">warunkowy — zależy od decyzji</span>
+            </div>
+            <div className="tabela">
+              {WIDOK.kroki.map(k => {
+                if (k.bramka) return (
+                  <div key={k.nr} className="wiersz wiersz-bramka">
+                    <span className="w-nr">{k.nr}</span>
+                    <span className="w-nazwa">◆ {k.nazwa}</span>
+                    <span className="w-bramka-tag">{k.bramka}</span>
+                  </div>
+                );
+                const pewnyTiket = k.tiketowy && !k.warunkowy;
+                const docs = dokTiketu[k.nr] || [];
+                return (
+                  <div key={k.nr} className={"wiersz-blok" + (k.warunkowy ? ' wiersz-war' : '')}>
+                    <div className="wiersz">
+                      <span className="w-nr">{k.nr}</span>
+                      <span className="w-nazwa">{k.nazwa}{k.warunkowy && <span className="w-galaz"> · ścieżka „{k.gałąź}"</span>}{k.wymagaDowodu && <span className="w-dowod"> · 📷 dowód</span>}</span>
+                      <span className="w-stanowisko">{k.stanowisko}</span>
+                      <span className="w-sla">{k.sla} {k.jedn}</span>
+                      {k.tiketowy
+                        ? <span className={"w-tag " + (k.warunkowy ? 'tag-war' : 'tag-t')} data-tip={k.warunkowy ? 'Tiket powstanie tylko jeśli proces pójdzie tą ścieżką po decyzji' : 'Tiket dla pracownika — powstanie od razu przy uruchomieniu'}>{k.warunkowy ? 'WARUNKOWY' : 'TIKET'}</span>
+                        : <span className="w-tag tag-nt" data-tip="Krok klienta lub systemu — nie tworzy tiketu, proces tylko czeka na zdarzenie">NT</span>}
+                    </div>
+                    {/* dokumenty per tiket — tylko pewne T */}
+                    {pewnyTiket && (
+                      <div className="dok-tiket">
+                        {docs.map((d, i) => (
+                          <span key={i} className="dok-chip">🔗 {d.nazwa}<button onClick={() => usunDokument(k.nr, i)}>×</button></span>
+                        ))}
+                        {edycjaDok === k.nr ? (
+                          <span className="dok-form">
+                            <input className="dok-mini" value={dNazwa} onChange={e => setDNazwa(e.target.value)} placeholder="nazwa" autoFocus />
+                            <input className="dok-mini" value={dUrl} onChange={e => setDUrl(e.target.value)} placeholder="link" />
+                            <button className="dok-ok" disabled={!dNazwa.trim()} onClick={() => dodajDokument(k.nr)}>OK</button>
+                            <button className="dok-x" onClick={() => { setEdycjaDok(null); setDNazwa(''); setDUrl(''); }}>×</button>
+                          </span>
+                        ) : (
+                          <button className="dok-add" onClick={() => setEdycjaDok(k.nr)}>+ dokument</button>
+                        )}
+                      </div>
+                    )}
+                    {k.tiketowy && k.warunkowy && (
+                      <div className="dok-tiket dok-war-info">dokumenty po wyborze ścieżki (z kokpitu)</div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+            <div className="podsumowanie-tiketow">
+              Powstanie <b>{krokiTiketowe.filter(k => !k.warunkowy).length} pewnych tiketów</b> + <b>{krokiTiketowe.filter(k => k.warunkowy).length} warunkowych</b> (po decyzji). Pierwszy aktywny od razu, reszta oczekująca.
+            </div>
+            <div className="nawigacja">
+              <button className="btn-ghost" onClick={() => setKrok(2)}>← Wstecz</button>
+              <button className="btn-primary" onClick={() => setKrok(4)}>Dalej → przypisz osoby</button>
+            </div>
+          </div>
+        )}
+
+        {/* KROK 4 — przypisanie osób */}
+        {krok === 4 && (
+          <div className="panel">
+            <h2>Przypisz osoby do stanowisk</h2>
+            <p className="opis">Opcjonalne na teraz — zlecenie może ruszyć z częściowym przypisaniem. Nieobsadzone stanowiska trafią do zarządzającego, gdy ich tiket się aktywuje. Listę pracowników można zmieniać też później (np. gdy ktoś odejdzie).</p>
+            <div className="przypisania">
+              {stanowiskaDoObsady.map(st => (
+                <div key={st} className="przypis-wiersz">
+                  <span className="przypis-stanowisko">{st}</span>
+                  <select value={przypisania[st] || ''} onChange={e => przypisz(st, e.target.value)}>
+                    <option value="">— do przypisania później —</option>
+                    {(PRACOWNICY[st] || []).map(os => <option key={os} value={os}>{os}</option>)}
+                  </select>
+                </div>
+              ))}
+            </div>
+            <div className="info-slownik">ℹ Stanowiska i pracownicy to osobny słownik organizacji — edytowalny w każdej chwili, także w trakcie realizacji zleceń.</div>
+            <div className="nawigacja">
+              <button className="btn-ghost" onClick={() => setKrok(3)}>← Wstecz</button>
+              <button className="btn-primary btn-uruchom" data-tip="Utwórz zlecenie i wygeneruj tikety z kroków pracowniczych" onClick={uruchom}>▶ Uruchom zlecenie</button>
+            </div>
+          </div>
+        )}
+
+        {/* KROK 5 — potwierdzenie */}
+        {krok === 5 && uruchomione && (
+          <div className="panel">
+            <div className="sukces">✓ Zlecenie uruchomione</div>
+            <div className="sukces-meta">{nrZlecenia} · {klient} · start {new Date(dataStart).toLocaleDateString('pl-PL')}{Object.values(dokTiketu).flat().length > 0 ? ` · 🔗 ${Object.values(dokTiketu).flat().length} dokumentów podpiętych` : ''}</div>
+            <h3 className="utw-tytul">Utworzone tikety</h3>
+            <div className="tabela">
+              {krokiTiketowe.map((k, i) => {
+                const aktywny = i === 0 && !k.warunkowy;
+                return (
+                  <div key={k.nr} className="wiersz">
+                    <span className="w-nr">{k.nr}</span>
+                    <span className="w-nazwa">{k.nazwa}</span>
+                    <span className="w-stanowisko">{przypisania[k.stanowisko] || k.stanowisko}</span>
+                    {k.warunkowy
+                      ? <span className="w-tag tag-war">WARUNKOWY</span>
+                      : aktywny ? <span className="w-tag tag-akt">● AKTYWNY</span>
+                        : <span className="w-tag tag-ocz">OCZEKUJE</span>}
+                  </div>
+                );
+              })}
+            </div>
+            <div className="podsumowanie-tiketow">
+              Pierwszy tiket jest aktywny i pojawił się u przypisanej osoby. Kolejne aktywują się, gdy domknie się poprzedni. Tikety warunkowe — po wyborze ścieżki przy decyzji.
+            </div>
+            <button className="btn-primary" onClick={() => { setKrok(1); setKlient(''); setPrzypisania({}); setDokTiketu({}); setUruchomione(false); }}>Uruchom kolejne zlecenie</button>
+          </div>
+        )}
+      </div>
+      <div className="dol-pasek">
+        <label className="podp-suwak">
+          <input type="checkbox" checked={podpowiedzi} onChange={e => setPodpowiedzi(e.target.checked)} />
+          <span className="podp-track"><span className="podp-galka" /></span>
+          <span className="podp-label">Podpowiedzi {podpowiedzi ? "wł." : "wył."}</span>
+        </label>
+      </div>
+      <div className="stopka">WORKFLY — od procesu do efektów · ZMIANOLOGICA, Dr Marcin Żółtak</div>
+    </div>
+  );
+}
+
+const styles = {
+  app: { minHeight: '100vh', background: '#16161a', color: '#e2e0db', fontFamily: "'Montserrat', system-ui, sans-serif", padding: 24 },
+  header: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', borderBottom: '1px solid #33333a', paddingBottom: 18, marginBottom: 24, maxWidth: 980, margin: '0 auto 24px' },
+  tresc: { maxWidth: 980, margin: '0 auto' },
+};
+
+const css = `
+@import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800&display=swap');
+* { font-family: 'Montserrat', system-ui, sans-serif; box-sizing: border-box; }
+.logo { font-size: 20px; font-weight: 800; letter-spacing: 0.04em; background: linear-gradient(90deg,#d99a4e,#c2873f); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.podtytul { font-size: 13px; color: #94908a; margin-top: 2px; }
+.kroki-wskaznik { display: flex; gap: 8px; }
+.krok-pkt { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #6b6760; padding: 6px 12px; border-radius: 20px; border: 1px solid #33333a; }
+.krok-pkt.aktywny { color: #fff; border-color: #c2873f; background: #2a1f10; }
+.krok-pkt.zrobiony { color: #9fc7a2; border-color: #3d5a3f; }
+.krok-num { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 9px; background: #33333a; font-size: 10px; font-weight: 700; }
+.aktywny .krok-num { background: #c2873f; color: #fff; }
+.zrobiony .krok-num { background: #3d5a3f; color: #9fc7a2; }
+.panel { background: #1f1f24; border: 1px solid #33333a; border-radius: 14px; padding: 28px; animation: fade 0.3s; }
+@keyframes fade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+h2 { font-size: 20px; font-weight: 700; color: #fff; margin: 0 0 6px; }
+h3 { color: #fff; }
+.opis { font-size: 13px; color: #94908a; line-height: 1.5; margin: 0 0 18px; }
+.proces-karta { background: #16161a; border: 1px solid #33333a; border-radius: 10px; padding: 16px; margin-bottom: 10px; }
+.proces-karta.wybrana { border-color: #c2873f; background: #2a1f10; }
+.proces-karta.wygaszona { color: #555049; font-size: 13px; border-style: dashed; }
+.proces-nazwa { font-size: 16px; font-weight: 700; color: #fff; }
+.proces-meta { font-size: 12px; color: #94908a; margin-top: 4px; }
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 22px; }
+.pole { display: flex; flex-direction: column; }
+.pole.szer2 { grid-column: span 2; }
+.pole label { font-size: 11px; font-weight: 600; color: #94908a; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px; }
+.hint { text-transform: none; font-weight: 400; color: #555049; }
+.pole input, .pole select, .przypis-wiersz select { background: #16161a; border: 1px solid #33333a; border-radius: 9px; padding: 11px; color: #fff; font-size: 14px; outline: none; }
+.pole input:focus, .pole select:focus { border-color: #c2873f; }
+.pole input.disabled { color: #94908a; background: #1a1a1f; }
+.nawigacja { display: flex; justify-content: space-between; margin-top: 8px; }
+.btn-primary { background: #c2873f; color: #fff; border: none; border-radius: 9px; padding: 12px 22px; font-size: 14px; font-weight: 700; cursor: pointer; }
+.btn-primary:hover { background: #d99a4e; }
+.btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-uruchom { background: #6b9b6e; }
+.btn-uruchom:hover { background: #7aad7d; }
+.btn-ghost { background: transparent; color: #94908a; border: 1px solid #33333a; border-radius: 9px; padding: 12px 22px; font-size: 14px; cursor: pointer; }
+.btn-ghost:hover { border-color: #555049; color: #cbc6be; }
+.legenda { display: flex; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+.lg { font-size: 11px; padding: 4px 10px; border-radius: 6px; }
+.lg-t { background: #26331f; color: #9fc7a2; }
+.lg-nt { background: #2a2a30; color: #94908a; }
+.lg-war { background: #3a2a14; color: #e8c98f; }
+.tabela { display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px; }
+.wiersz { display: flex; align-items: center; gap: 12px; background: #16161a; border: 1px solid #2a2a30; border-radius: 8px; padding: 11px 14px; font-size: 13px; }
+.wiersz-bramka { background: #221b10; border-color: #5c3f1d; }
+.wiersz-war { opacity: 0.78; border-style: dashed; }
+.w-nr { font-family: monospace; font-size: 11px; color: #c2873f; font-weight: 700; min-width: 44px; }
+.w-nazwa { flex: 1; color: #fff; }
+.w-galaz { color: #94908a; font-size: 11px; }
+.w-bramka-tag { font-size: 10px; background: #3a2a14; color: #e8c98f; padding: 3px 8px; border-radius: 5px; font-weight: 700; }
+.w-stanowisko { font-size: 12px; color: #94908a; min-width: 90px; }
+.w-sla { font-size: 11px; color: #6b6760; font-family: monospace; min-width: 50px; }
+.w-tag { font-size: 9px; font-weight: 700; padding: 3px 8px; border-radius: 5px; letter-spacing: 0.04em; min-width: 70px; text-align: center; }
+.tag-t { background: #26331f; color: #9fc7a2; }
+.tag-nt { background: #2a2a30; color: #94908a; }
+.tag-war { background: #3a2a14; color: #e8c98f; }
+.tag-akt { background: #2a3a2a; color: #9fc7a2; }
+.tag-ocz { background: #2a2a30; color: #94908a; }
+.podsumowanie-tiketow { font-size: 13px; color: #aaa49c; background: #16161a; border: 1px solid #33333a; border-radius: 9px; padding: 13px; line-height: 1.5; margin-bottom: 16px; }
+.przypisania { display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px; }
+.przypis-wiersz { display: flex; align-items: center; gap: 14px; }
+.przypis-stanowisko { min-width: 130px; font-size: 14px; font-weight: 600; color: #fff; }
+.przypis-wiersz select { flex: 1; }
+.info-slownik { font-size: 12px; color: #8a7340; background: #221b10; border: 1px solid #3a2a14; border-radius: 9px; padding: 11px; margin-bottom: 18px; line-height: 1.4; }
+.sukces { font-size: 22px; font-weight: 800; color: #9fc7a2; margin-bottom: 4px; }
+.sukces-meta { font-size: 13px; color: #94908a; margin-bottom: 22px; }
+.utw-tytul { font-size: 15px; margin: 0 0 12px; }
+.w-dowod { color: #d99a4e; font-size: 11px; }
+.dok-tiket { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 8px 14px 10px 56px; background: #14140f; border: 1px solid #2a2a30; border-top: none; border-radius: 0 0 8px 8px; }
+.dok-war-info { font-size: 11px; color: #6b6760; font-style: italic; padding-left: 56px; }
+.dok-chip { display: inline-flex; align-items: center; gap: 5px; background: #1f1f24; border: 1px solid #3a2a14; color: #e8c98f; border-radius: 6px; padding: 4px 8px; font-size: 11px; }
+.dok-chip button { background: none; border: none; color: #94908a; cursor: pointer; font-size: 14px; line-height: 1; padding: 0; }
+.dok-chip button:hover { color: #e06b6b; }
+.dok-add { background: transparent; border: 1px dashed #5c3f1d; color: #d99a4e; border-radius: 6px; padding: 4px 10px; font-size: 11px; cursor: pointer; }
+.dok-add:hover { background: #2a1f10; }
+.dok-form { display: inline-flex; gap: 4px; align-items: center; }
+.dok-mini { background: #16161a; border: 1px solid #33333a; border-radius: 6px; padding: 4px 7px; color: #fff; font-size: 12px; width: 110px; outline: none; }
+.dok-mini:focus { border-color: #c2873f; }
+.dok-ok { background: #6b9b6e; color: #fff; border: none; border-radius: 6px; padding: 4px 9px; font-size: 11px; font-weight: 700; cursor: pointer; }
+.dok-ok:disabled { opacity: 0.4; }
+.dok-x { background: #2a2a30; color: #94908a; border: none; border-radius: 6px; padding: 4px 8px; font-size: 12px; cursor: pointer; }
+.wiersz-blok { margin-bottom: 6px; }
+.wiersz-blok .wiersz { margin-bottom: 0; }
+[data-tip] { position: relative; }
+[data-tip]:hover::after { content: attr(data-tip); position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%); background: #0d0d10; color: #e2e0db; border: 1px solid #5c3f1d; border-radius: 8px; padding: 7px 11px; font-size: 11px; font-weight: 500; line-height: 1.4; white-space: normal; width: max-content; max-width: 230px; z-index: 100; box-shadow: 0 6px 20px rgba(0,0,0,0.5); pointer-events: none; }
+[data-tip]:hover::before { content: ""; position: absolute; bottom: calc(100% + 2px); left: 50%; transform: translateX(-50%); border: 6px solid transparent; border-top-color: #5c3f1d; z-index: 100; pointer-events: none; }
+.bez-podpowiedzi [data-tip]:hover::after, .bez-podpowiedzi [data-tip]:hover::before { display: none !important; }
+.dol-pasek { max-width: 980px; margin: 20px auto 0; display: flex; justify-content: flex-end; }
+.podp-suwak { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
+.podp-suwak input { display: none; }
+.podp-track { width: 36px; height: 20px; background: #33333a; border-radius: 10px; position: relative; transition: background 0.2s; }
+.podp-galka { position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #94908a; transition: all 0.2s; }
+.podp-suwak input:checked + .podp-track { background: #c2873f; }
+.podp-suwak input:checked + .podp-track .podp-galka { left: 18px; background: #fff; }
+.podp-label { font-size: 12px; color: #94908a; }
+.stopka { font-size: 11px; color: #44403a; margin: 26px auto 0; text-align: center; max-width: 980px; }
+`;
+
+return UruchomienieZlecenia;
+})();
+
+const ModTikety = (function() {
+// ============================================================
+// WORKFLY — widok pracownika (mobile-first). Makieta UX. v2
+// Trzy statusy w sekcjach: Do zrobienia → W trakcie → Zrobione.
+// Mechanika: "Zacznij" (nieobowiązkowe) → "W trakcie" → "Zrobione".
+// Domknięcie ze znacznikiem czasu; ponowny klik "Zrobione" = cofnij.
+// Procesowe + ad hoc na jednej liście, pilność sortuje w sekcji,
+// dni/godz do końca z wartością ujemną. Bez przekreślenia.
+// PROTOTYP — bez zapisu. Dane: proces serwisowy Loxone.
+// ============================================================
+
+const TERAZ = new Date('2026-06-03T17:58:00');
+
+function doKonca(deadlineISO, jednostka) {
+  if (!deadlineISO) return 9999; // bez terminu (makieta nie liczy baseline) -> traktuj jak odległy
+  const ms = new Date(deadlineISO) - TERAZ;
+  return jednostka === 'godz' ? Math.round(ms / 3600000) : Math.round(ms / 86400000);
+}
+function kolorPilnosci(w, jednostka) {
+  // progi zależne od jednostki SLA (godziny vs dni) — w realnym systemie konfigurowalne
+  if (w < 0) return 'czerwony';            // po terminie
+  if (jednostka === 'godz') {
+    if (w <= 2) return 'pomaranczowy';     // zostały <=2h: działaj teraz
+    if (w <= 6) return 'zolty';            // zbliża się
+    return 'zielony';
+  }
+  // dni
+  if (w === 0) return 'pomaranczowy';      // termin dziś
+  if (w <= 2) return 'zolty';              // zbliża się
+  return 'zielony';
+}
+
+const TIKETY_START = [
+  { id: 't1', typ: 'proces', status: 'do', nazwa: 'Naprawa zdalna systemu Loxone', zlecenie: 'ZLEC-2026-014', klient: 'Kowalski / dom Sopot', krok: '2a.1', stanowisko: 'Serwisant', deadline: '2026-06-03T20:00:00', jednostka: 'godz', wymagaDowodu: true, dowodDolaczony: false, dokZadania: [{ nazwa: 'Instrukcja serwisowa Loxone', url: '#' }, { nazwa: 'Lista kontrolna naprawy', url: '#' }], dokZlecenia: [{ nazwa: 'Plan instalacji — dom Sopot', url: '#' }, { nazwa: 'Zdjęcia szafy sterowniczej', url: '#' }, { nazwa: 'Uwagi klienta', url: '#' }] },
+  { id: 't2', typ: 'proces', status: 'trakcie', nazwa: 'Diagnoza zdalna i AI Triage', zlecenie: 'ZLEC-2026-017', klient: 'Nowak / biuro Gdynia', krok: '2a', stanowisko: 'Serwisant', deadline: '2026-06-04T16:00:00', jednostka: 'godz', wymagaDowodu: false, dokZadania: [{ nazwa: 'Procedura diagnozy', url: '#' }], dokZlecenia: [{ nazwa: 'Opis usterki od klienta', url: '#' }] },
+  { id: 't3', typ: 'adhoc', status: 'do', odKogo: 'kolega', odOsoba: 'Tomek (koordynator)', nazwa: 'Przygotuj wycenę dodatkową — klient Wiśniewski', deadline: '2026-06-02T16:00:00', jednostka: 'dni', opis: 'Klient dzwonił, prosi o wycenę rozbudowy o moduł oświetlenia.', linki: [{ nazwa: 'Cennik modułów', url: '#' }] },
+  { id: 't4', typ: 'adhoc', status: 'do', odKogo: 'przelozony', odOsoba: 'Justyna (COO)', nazwa: 'Uzupełnij raport serwisowy za maj', deadline: '2026-06-05T16:00:00', jednostka: 'dni', opis: 'Potrzebne do rozliczenia kwartału.', linki: [] },
+  { id: 't5', typ: 'adhoc', status: 'trakcie', odKogo: 'wlasne', nazwa: 'Zadzwonić do hurtowni — kable', deadline: '2026-06-03T16:00:00', jednostka: 'dni', opis: 'Sprawdzić dostępność na przyszły tydzień.', linki: [] },
+  { id: 't7', typ: 'adhoc', status: 'do', odKogo: 'wlasne', nazwa: 'Zadzwonić do klienta Lewandowski — postęp prac', deadline: '2026-06-05T14:00:00', jednostka: 'dni', opis: 'Klient prosił o telefon o 14:00 z informacją o postępie.', alarm: true, alarmGodz: '14:00', linki: [] },
+  { id: 't6', typ: 'proces', status: 'oczek', nazwa: 'Zamknięcie ticketu i fakturowanie', zlecenie: 'ZLEC-2026-014', klient: 'Kowalski / dom Sopot', krok: '3', stanowisko: 'Serwisant', deadline: '2026-06-04T16:00:00', jednostka: 'godz', linki: [] },
+];
+
+function WorkflyMobile() {
+  const baza = useBaza();
+  const bazaPusta = baza.tikety.length === 0 && baza.adhoc.length === 0;
+  // mapowanie tiketów magazynu -> kształt widoku
+  const STAT_MAP = { do: 'do', trakcie: 'trakcie', zrobione: 'zrob' };
+  const zMagazynu = useMemo(() => {
+    const proc = baza.tikety
+      .filter(tk => tk.typ === 'zadanie' && tk.widoczny !== false && (tk.stan === 'aktywny' || (tk.stan !== 'anulowany' && tk.statusPracy === 'zrobione')))
+      .map(tk => ({ id: tk.id, _magazyn: true, typ: 'proces',
+        status: tk.stan === 'aktywny' || tk.statusPracy === 'zrobione' ? STAT_MAP[tk.statusPracy] : 'oczek',
+        nazwa: tk.nazwa, zlecenie: tk.zlecenieNr, klient: tk.klient, krok: tk.numer,
+        stanowisko: tk.stanowisko, deadline: tk.deadline, jednostka: tk.slaJedn || 'dni',
+        wymagaDowodu: tk.wymagaDowodu, dowodDolaczony: tk.dowodDolaczony,
+        dokZadania: tk.dokZadania || [], dokZlecenia: tk.dokZlecenia || [], wykonano: tk.wykonano }));
+    const oczek = baza.tikety
+      .filter(tk => tk.typ === 'zadanie' && tk.widoczny !== false && tk.stan === 'oczekujacy')
+      .map(tk => ({ id: tk.id, _magazyn: true, typ: 'proces', status: 'oczek', nazwa: tk.nazwa,
+        zlecenie: tk.zlecenieNr, klient: tk.klient, krok: tk.numer, stanowisko: tk.stanowisko,
+        deadline: tk.deadline, jednostka: tk.slaJedn || 'dni', dokZadania: tk.dokZadania || [], dokZlecenia: tk.dokZlecenia || [] }));
+    const ah = baza.adhoc.map(a => ({ ...a, _magazyn: true, _adhoc: true, typ: 'adhoc' }));
+    return [...proc, ...oczek, ...ah];
+  }, [baza]);
+  const [tiketyDemo, setTiketyDemo] = useState(TIKETY_START);
+  const tikety = bazaPusta ? tiketyDemo : zMagazynu;
+  const setTikety = setTiketyDemo; // demo działa po staremu; magazynowe piszą przez tiketUstaw/adhocUstaw
+  const [potwierdz, setPotwierdz] = useState(null);
+  const [cofanie, setCofanie] = useState(null);
+  const [odrzuc, setOdrzuc] = useState(null);
+  const [powod, setPowod] = useState('');
+  const [nowy, setNowy] = useState(false);
+  const [rozwinOczek, setRozwinOczek] = useState(false);
+  const [rozwinZrob, setRozwinZrob] = useState(true);
+  const [szczegoly, setSzczegoly] = useState(null);
+  const [nNazwa, setNNazwa] = useState(''); const [nDla, setNDla] = useState('siebie'); const [nData, setNData] = useState(''); const [nGodz, setNGodz] = useState(''); const [nAlarm, setNAlarm] = useState(false); const [nOpis, setNOpis] = useState('');
+
+  const wzbogac = t => ({ ...t, dk: doKonca(t.deadline, t.jednostka) });
+  const sortPiln = (a, b) => a.dk - b.dk;
+
+  const doZrobienia = useMemo(() => tikety.filter(t => t.status === 'do').map(wzbogac).sort(sortPiln), [tikety]);
+  const wTrakcie = useMemo(() => tikety.filter(t => t.status === 'trakcie').map(wzbogac).sort(sortPiln), [tikety]);
+  const zrobione = useMemo(() => tikety.filter(t => t.status === 'zrob'), [tikety]);
+  const oczekujace = useMemo(() => tikety.filter(t => t.status === 'oczek'), [tikety]);
+
+  const zMag = id => tikety.find(t => t.id === id && t._magazyn);
+  function zacznij(id) {
+    const m = zMag(id);
+    if (m) { m._adhoc ? adhocUstaw(id, { status: 'trakcie' }) : tiketUstaw(id, { statusPracy: 'trakcie' }); return; }
+    setTikety(ts => ts.map(t => t.id === id ? { ...t, status: 'trakcie' } : t));
+  }
+  function dolaczDowod(id) {
+    const m = zMag(id);
+    if (m) { tiketUstaw(id, { dowodDolaczony: true }); return; }
+    setTikety(ts => ts.map(t => t.id === id ? { ...t, dowodDolaczony: true } : t));
+  }
+  function domknij(id) {
+    const stamp = new Date().toLocaleString('pl-PL', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+    const m = zMag(id);
+    if (m) { m._adhoc ? adhocUstaw(id, { status: 'zrobione', wykonano: stamp }) : tiketUstaw(id, { statusPracy: 'zrobione', wykonano: stamp }); setPotwierdz(null); return; }
+    setTikety(ts => ts.map(t => t.id === id ? { ...t, status: 'zrob', wykonano: stamp } : t));
+    setPotwierdz(null);
+  }
+  function cofnij(id) {
+    const m = zMag(id);
+    if (m) { m._adhoc ? adhocUstaw(id, { status: 'trakcie', wykonano: null }) : tiketUstaw(id, { statusPracy: 'trakcie', wykonano: null }); setCofanie(null); return; }
+    setTikety(ts => ts.map(t => t.id === id ? { ...t, status: 'trakcie', wykonano: null } : t)); setCofanie(null);
+  }
+  function wykonajOdrzuc() {
+    if (!powod.trim()) return;
+    const m = zMag(odrzuc);
+    if (m && m._adhoc) { adhocUstaw(odrzuc, { status: 'odrzucony', powod: powod.trim() }); }
+    else setTikety(ts => ts.map(t => t.id === odrzuc ? { ...t, status: 'odrzucony', powod: powod.trim() } : t));
+    setOdrzuc(null); setPowod('');
+  }
+  function dodaj() {
+    if (!nNazwa.trim()) return;
+    const czas = nGodz || '16:00';
+    adhocDodaj({ typ: 'adhoc', status: 'do', odKogo: 'wlasne', nazwa: nNazwa.trim(), deadline: (nData || new Date().toISOString().slice(0,10)) + 'T' + czas + ':00', jednostka: 'dni', opis: nOpis.trim(), alarm: nAlarm, alarmGodz: nAlarm ? czas : null, linki: [] });
+    setNowy(false); setNNazwa(''); setNData(''); setNGodz(''); setNAlarm(false); setNOpis(''); setNDla('siebie');
+  }
+
+  const licznikTxt = t => t.deadline ? `${t.dk} ${t.jednostka}` : 'bez terminu';
+  const liczbaDok = t => (t.dokZadania?.length || 0) + (t.dokZlecenia?.length || 0) + (t.linki?.length || 0);
+
+  function Kafelek({ t, sekcja }) {
+    const kolor = kolorPilnosci(t.dk, t.jednostka);
+    return (
+      <div className={"m-tiket " + (sekcja === 'trakcie' ? 'm-w-trakcie ' : '') + "m-" + kolor} onClick={() => setSzczegoly(t)}>
+        <div className="m-tiket-gora">
+          <span className={"m-typ m-typ-" + t.typ}>{t.typ === 'proces' ? 'PROCES' : 'AD HOC'}</span>
+          {sekcja === 'trakcie' && <span className="m-tag-trakcie">▶ W TRAKCIE</span>}
+          <span className={"m-licznik m-licznik-" + kolor}>{licznikTxt(t)}</span>
+        </div>
+        <div className="m-tiket-nazwa">{t.nazwa}</div>
+        <div className="m-tiket-zrodlo">
+          {t.typ === 'proces' ? `${t.zlecenie} · ${t.klient}`
+            : t.odKogo === 'wlasne' ? 'Zadanie własne' : `Od: ${t.odOsoba}`}
+        </div>
+        <div className="m-tiket-dol">
+          <span>{t.deadline ? 'do ' + new Date(t.deadline).toLocaleDateString('pl-PL', { day: '2-digit', month: '2-digit' }) : 'termin: —'}{t.alarm && t.alarmGodz ? ` · 🔔 ${t.alarmGodz}` : ''}</span>
+          {liczbaDok(t) > 0 && <span>🔗 {liczbaDok(t)}</span>}
+        </div>
+        {t.wymagaDowodu && (
+          <div className={"m-dowod-pasek " + (t.dowodDolaczony ? "m-dowod-ok" : "m-dowod-brak")}>
+            {t.dowodDolaczony ? "📷 dowód dołączony ✓" : "📷 wymaga zdjęcia-dowodu przed zamknięciem"}
+          </div>
+        )}
+        <div className="m-akcje" onClick={e => e.stopPropagation()}>
+          {sekcja === 'do' && <button className="m-btn-zacznij" onClick={(e) => { e.stopPropagation(); zacznij(t.id); }}>▶ Zacznij</button>}
+          {t.wymagaDowodu && !t.dowodDolaczony && <button className="m-btn-dowod" onClick={(e) => { e.stopPropagation(); dolaczDowod(t.id); }}>📷 Dodaj dowód</button>}
+          <button className="m-btn-zrob" disabled={t.wymagaDowodu && !t.dowodDolaczony} onClick={(e) => { e.stopPropagation(); setPotwierdz(t.id); }}>✓ Zrobione</button>
+          {t.typ === 'adhoc' && t.odKogo === 'kolega' && <button className="m-btn-odrzuc" onClick={(e) => { e.stopPropagation(); setOdrzuc(t.id); }}>Odrzuć</button>}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={styles.scena}>
+      <style>{css}</style>
+      <div style={styles.telefon}>
+        <div style={styles.notch} />
+        <div style={styles.ekran}>
+          <div className="m-header"><div className="m-logo">WORKFLY</div><div className="m-user">Michał · Serwisant</div></div>
+
+          <div className="m-summary">
+            <div className="m-sum-item"><b>{doZrobienia.length}</b><span>do zrobienia</span></div>
+            <div className="m-sum-item"><b className="bursztyn-txt">{wTrakcie.length}</b><span>w trakcie</span></div>
+            <div className="m-sum-item"><b className="czerwony-txt">{[...doZrobienia, ...wTrakcie].filter(t => t.dk < 0).length}</b><span>po terminie</span></div>
+          </div>
+
+          {/* DO ZROBIENIA */}
+          <div className="m-sekcja-tytul">Do zrobienia <span className="m-hint-sort">wg pilności</span></div>
+          <div className="m-lista">
+            {doZrobienia.length === 0 && <div className="m-pusto">Nic nowego do podjęcia.</div>}
+            {doZrobienia.map(t => <Kafelek key={t.id} t={t} sekcja="do" />)}
+          </div>
+
+          {/* W TRAKCIE */}
+          {wTrakcie.length > 0 && (<>
+            <div className="m-sekcja-tytul">W trakcie</div>
+            <div className="m-lista">{wTrakcie.map(t => <Kafelek key={t.id} t={t} sekcja="trakcie" />)}</div>
+          </>)}
+
+          {/* OCZEKUJĄCE */}
+          {oczekujace.length > 0 && (
+            <div className="m-oczek">
+              <button className="m-oczek-head" onClick={() => setRozwinOczek(!rozwinOczek)}>
+                <span>⏳ Oczekujące ({oczekujace.length})</span><span>{rozwinOczek ? '▲' : '▼'}</span>
+              </button>
+              {rozwinOczek && oczekujace.map(t => (
+                <div key={t.id} className="m-tiket m-oczek-tiket">
+                  <div className="m-tiket-nazwa">{t.nazwa}</div>
+                  <div className="m-tiket-zrodlo">{t.zlecenie} · {t.klient}</div>
+                  <div className="m-oczek-info">czeka, aż domknie się poprzedni krok</div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* ZROBIONE */}
+          {zrobione.length > 0 && (
+            <div className="m-zrobione-sekcja">
+              <button className="m-oczek-head" onClick={() => setRozwinZrob(!rozwinZrob)}>
+                <span>✓ Zrobione dziś ({zrobione.length})</span><span>{rozwinZrob ? '▲' : '▼'}</span>
+              </button>
+              {rozwinZrob && zrobione.map(t => (
+                <div key={t.id} className="m-tiket m-zrobiony" onClick={() => setCofanie(t.id)}>
+                  <div className="m-zrob-gora">
+                    <span className="m-zrob-check">✓</span>
+                    <span className="m-tiket-nazwa">{t.nazwa}</span>
+                  </div>
+                  <div className="m-tiket-zrodlo">Wykonano: {t.wykonano} · dotknij, aby cofnąć</div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div style={{ height: 80 }} />
+        </div>
+
+        <button className="m-fab" onClick={() => setNowy(true)}>+</button>
+
+        {potwierdz && (
+          <Modal onZamknij={() => setPotwierdz(null)}>
+            <div className="m-modal-tytul">Oznaczyć jako zrobione?</div>
+            <div className="m-modal-tresc">System zapisze czas wykonania: <b>{TERAZ.toLocaleString('pl-PL', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' })}</b>. Będzie można cofnąć.</div>
+            <button className="m-btn-zrob m-pelny" onClick={() => domknij(potwierdz)}>✓ Tak, zrobione</button>
+            <button className="m-btn-szary m-pelny" onClick={() => setPotwierdz(null)}>Anuluj</button>
+          </Modal>
+        )}
+
+        {cofanie && (
+          <Modal onZamknij={() => setCofanie(null)}>
+            <div className="m-modal-tytul">Anulować „zrobione"?</div>
+            <div className="m-modal-tresc">Zadanie wróci do sekcji „W trakcie".</div>
+            <button className="m-btn-zacznij m-pelny" onClick={() => cofnij(cofanie)}>↶ Tak, cofnij</button>
+            <button className="m-btn-szary m-pelny" onClick={() => setCofanie(null)}>Zostaw zrobione</button>
+          </Modal>
+        )}
+
+        {odrzuc && (
+          <Modal onZamknij={() => { setOdrzuc(null); setPowod(''); }}>
+            <div className="m-modal-tytul">Odrzucasz zadanie od kolegi</div>
+            <div className="m-modal-tresc">Podaj powód — zostanie zapisany i przekazany osobie, która wystawiła zadanie.</div>
+            <textarea className="m-input m-textarea" value={powod} onChange={e => setPowod(e.target.value)} placeholder="np. To zadanie należy do innego zespołu / brak mocy przerobowych dziś" />
+            <button className="m-btn-odrzuc m-pelny" disabled={!powod.trim()} onClick={wykonajOdrzuc}>Odrzuć z wyjaśnieniem</button>
+            <button className="m-btn-szary m-pelny" onClick={() => { setOdrzuc(null); setPowod(''); }}>Anuluj</button>
+          </Modal>
+        )}
+
+        {nowy && (
+          <Modal onZamknij={() => setNowy(false)}>
+            <div className="m-modal-tytul">Nowe zadanie</div>
+            <label className="m-label">Co trzeba zrobić?</label>
+            <input className="m-input" value={nNazwa} onChange={e => setNNazwa(e.target.value)} placeholder="np. Zadzwonić do klienta" autoFocus />
+            <label className="m-label">Dla kogo?</label>
+            <div className="m-toggle">
+              <button className={nDla === 'siebie' ? 'on' : ''} onClick={() => setNDla('siebie')}>Dla siebie</button>
+              <button className={nDla === 'inny' ? 'on' : ''} onClick={() => setNDla('inny')}>Dla kogoś</button>
+            </div>
+            {nDla === 'inny' && <div className="m-hint-mini">Osoba dostanie zadanie i — jako od kolegi — będzie mogła je odrzucić z wyjaśnieniem.</div>}
+            <label className="m-label">Termin</label>
+            <div className="m-data-godz">
+              <input className="m-input" type="date" value={nData} onChange={e => setNData(e.target.value)} style={{ flex: 1 }} />
+              <input className="m-input" type="time" value={nGodz} onChange={e => setNGodz(e.target.value)} style={{ flex: '0 0 110px' }} />
+            </div>
+            {nDla === 'siebie' && (
+              <label className="m-alarm-row">
+                <input type="checkbox" checked={nAlarm} onChange={e => setNAlarm(e.target.checked)} />
+                <span>🔔 Przypomnij dźwiękiem o tej godzinie</span>
+              </label>
+            )}
+            {nDla === 'siebie' && nAlarm && <div className="m-hint-mini">Telefon przypomni Ci dźwiękiem o ustawionej godzinie — nawet gdy aplikacja jest zamknięta.</div>}
+            <label className="m-label">Notatka (opcjonalnie)</label>
+            <textarea className="m-input m-textarea" value={nOpis} onChange={e => setNOpis(e.target.value)} placeholder="szczegóły…" />
+            <button className="m-btn-zrob m-pelny" disabled={!nNazwa.trim()} onClick={dodaj}>Utwórz zadanie</button>
+          </Modal>
+        )}
+
+        {szczegoly && (
+          <Modal onZamknij={() => setSzczegoly(null)}>
+            <span className={"m-typ m-typ-" + szczegoly.typ}>{szczegoly.typ === 'proces' ? 'ZADANIE PROCESOWE' : 'ZADANIE AD HOC'}</span>
+            <div className="m-modal-tytul" style={{ marginTop: 8 }}>{szczegoly.nazwa}</div>
+            {szczegoly.typ === 'proces' && <div className="m-modal-tresc">{szczegoly.zlecenie} · {szczegoly.klient}<br />Krok {szczegoly.krok} · {szczegoly.stanowisko}</div>}
+            {szczegoly.opis && <div className="m-modal-tresc">{szczegoly.opis}</div>}
+            <div className="m-modal-tresc">Termin: <b>{new Date(szczegoly.deadline).toLocaleString('pl-PL', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' })}</b></div>
+            {szczegoly.wymagaDowodu && (
+              <div className={"m-dowod-pasek " + (szczegoly.dowodDolaczony ? "m-dowod-ok" : "m-dowod-brak")} style={{ marginBottom: 12 }}>
+                {szczegoly.dowodDolaczony ? "📷 dowód dołączony ✓" : "📷 ten krok wymaga zdjęcia-dowodu przed zamknięciem"}
+              </div>
+            )}
+            {szczegoly.dokZadania?.length > 0 && (
+              <div className="m-dok-grupa">
+                <div className="m-dok-naglowek">📋 Dokumenty zadania</div>
+                {szczegoly.dokZadania.map((l, i) => <a key={i} className="m-link-chip" href={l.url}>🔗 {l.nazwa}</a>)}
+              </div>
+            )}
+            {szczegoly.dokZlecenia?.length > 0 && (
+              <div className="m-dok-grupa">
+                <div className="m-dok-naglowek">📁 Dokumenty zlecenia <span className="m-dok-hint">(materiały od klienta)</span></div>
+                {szczegoly.dokZlecenia.map((l, i) => <a key={i} className="m-link-chip" href={l.url}>🔗 {l.nazwa}</a>)}
+              </div>
+            )}
+            {szczegoly.linki?.length > 0 && <div className="m-modal-linki">{szczegoly.linki.map((l, i) => <a key={i} className="m-link-chip" href={l.url}>🔗 {l.nazwa}</a>)}</div>}
+          </Modal>
+        )}
+      </div>
+      <div className="stopka">WORKFLY — od procesu do efektów · ZMIANOLOGICA, Dr Marcin Żółtak</div>
+    </div>
+  );
+}
+
+function Modal({ children, onZamknij }) {
+  return <div className="m-modal-tlo" onClick={onZamknij}><div className="m-modal" onClick={e => e.stopPropagation()}>{children}</div></div>;
+}
+
+const styles = {
+  scena: { minHeight: '100vh', background: '#0d0d10', display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '24px 12px', fontFamily: "'Montserrat', system-ui, sans-serif" },
+  telefon: { position: 'relative', width: 390, maxWidth: '100%', height: 820, background: '#16161a', borderRadius: 36, border: '10px solid #2a2a30', boxShadow: '0 20px 60px rgba(0,0,0,0.5)', overflow: 'hidden' },
+  notch: { position: 'absolute', top: 0, left: '50%', transform: 'translateX(-50%)', width: 140, height: 22, background: '#2a2a30', borderRadius: '0 0 14px 14px', zIndex: 30 },
+  ekran: { height: '100%', overflowY: 'auto', padding: '34px 16px 16px' },
+};
+
+const css = `
+@import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800&display=swap');
+* { font-family: 'Montserrat', system-ui, sans-serif; box-sizing: border-box; }
+.m-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 14px; }
+.m-logo { font-size: 18px; font-weight: 800; letter-spacing: 0.04em; background: linear-gradient(90deg,#d99a4e,#c2873f); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.m-user { font-size: 12px; color: #94908a; }
+.m-summary { display: flex; gap: 8px; margin-bottom: 14px; }
+.m-sum-item { flex: 1; background: #1f1f24; border: 1px solid #33333a; border-radius: 12px; padding: 10px; text-align: center; }
+.m-sum-item b { display: block; font-size: 22px; color: #fff; font-weight: 800; }
+.m-sum-item span { font-size: 10px; color: #94908a; }
+.czerwony-txt { color: #e06b6b !important; }
+.bursztyn-txt { color: #d99a4e !important; }
+.m-sekcja-tytul { font-size: 13px; font-weight: 700; color: #cbc6be; text-transform: uppercase; letter-spacing: 0.05em; margin: 18px 0 10px; display: flex; justify-content: space-between; align-items: center; }
+.m-hint-sort { font-size: 10px; color: #6b6760; font-weight: 400; text-transform: none; }
+.m-lista { display: flex; flex-direction: column; gap: 10px; }
+.m-pusto { text-align: center; color: #6b6760; padding: 22px; font-size: 13px; }
+.m-tiket { background: #1f1f24; border: 1px solid #33333a; border-left: 4px solid #44444d; border-radius: 12px; padding: 13px; cursor: pointer; transition: all 0.15s; }
+.m-tiket:active { transform: scale(0.99); }
+.m-zielony { border-left-color: #6b9b6e; }
+.m-zolty { border-left-color: #e0c14e; }
+.m-pomaranczowy { border-left-color: #e08a3c; }
+.m-czerwony { border-left-color: #e06b6b; background: #2a1f1f; }
+.m-w-trakcie { background: #261d12; border-color: #5c3f1d; box-shadow: inset 0 0 0 1px #5c3f1d; }
+.m-tiket-gora { display: flex; justify-content: space-between; align-items: center; margin-bottom: 7px; gap: 6px; }
+.m-typ { font-size: 9px; font-weight: 700; padding: 2px 7px; border-radius: 5px; letter-spacing: 0.04em; }
+.m-typ-proces { background: #2d2438; color: #c9a9e0; }
+.m-typ-adhoc { background: #3a2a14; color: #e8c98f; }
+.m-tag-trakcie { font-size: 9px; font-weight: 700; color: #d99a4e; letter-spacing: 0.04em; margin-left: auto; margin-right: 6px; }
+.m-licznik { font-size: 12px; font-weight: 700; font-family: monospace; padding: 2px 8px; border-radius: 6px; }
+.m-licznik-zielony { background: #26331f; color: #9fc7a2; }
+.m-licznik-zolty { background: #3a3414; color: #ece08f; }
+.m-licznik-pomaranczowy { background: #3d2410; color: #f0b87a; }
+.m-licznik-czerwony { background: #4a1f1f; color: #f0a0a0; }
+.m-tiket-nazwa { font-size: 15px; font-weight: 700; color: #fff; line-height: 1.3; margin-bottom: 4px; }
+.m-tiket-zrodlo { font-size: 12px; color: #94908a; margin-bottom: 8px; }
+.m-tiket-dol { display: flex; justify-content: space-between; font-size: 11px; color: #6b6760; margin-bottom: 10px; }
+.m-akcje { display: flex; gap: 8px; }
+.m-btn-zacznij { flex: 1; background: #3a2a14; color: #e8c98f; border: 1px solid #5c3f1d; border-radius: 9px; padding: 11px; font-size: 14px; font-weight: 700; cursor: pointer; }
+.m-btn-zacznij:active { background: #4a3518; }
+.m-btn-zrob { flex: 1; background: #2a3a2a; color: #9fc7a2; border: 1px solid #3d5a3f; border-radius: 9px; padding: 11px; font-size: 14px; font-weight: 700; cursor: pointer; }
+.m-btn-zrob:active { background: #34492f; }
+.m-btn-zrob:disabled { opacity: 0.4; }
+.m-btn-odrzuc { background: transparent; color: #e06b6b; border: 1px solid #5a2a2a; border-radius: 9px; padding: 11px 14px; font-size: 13px; cursor: pointer; }
+.m-btn-szary { background: #2a2a30; color: #94908a; border: none; border-radius: 9px; padding: 11px; font-size: 14px; cursor: pointer; }
+.m-pelny { width: 100%; margin-top: 8px; }
+.m-oczek, .m-zrobione-sekcja { margin-top: 18px; }
+.m-oczek-head { width: 100%; display: flex; justify-content: space-between; background: #1a1a1f; border: 1px solid #33333a; border-radius: 10px; padding: 12px; color: #94908a; font-size: 13px; font-weight: 600; cursor: pointer; margin-bottom: 8px; }
+.m-oczek-tiket { opacity: 0.6; border-left-color: #44444d; cursor: default; margin-bottom: 8px; }
+.m-oczek-info { font-size: 11px; color: #6b6760; font-style: italic; margin-top: 4px; }
+.m-zrobiony { opacity: 0.6; border-left-color: #6b9b6e; background: #1c241c; margin-bottom: 8px; }
+.m-zrob-gora { display: flex; align-items: center; gap: 8px; }
+.m-zrob-check { color: #6b9b6e; font-weight: 800; font-size: 16px; }
+.m-zrobiony .m-tiket-nazwa { margin-bottom: 2px; font-size: 14px; }
+.m-fab { position: absolute; bottom: 20px; right: 20px; width: 56px; height: 56px; border-radius: 28px; background: #c2873f; color: #fff; border: none; font-size: 30px; font-weight: 300; cursor: pointer; box-shadow: 0 6px 20px rgba(194,135,63,0.4); z-index: 20; }
+.m-fab:active { transform: scale(0.95); }
+.m-modal-tlo { position: absolute; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: flex-end; z-index: 40; }
+.m-modal { background: #1f1f24; border-top: 1px solid #33333a; border-radius: 20px 20px 0 0; padding: 22px 18px 28px; width: 100%; animation: wjazd 0.25s ease; }
+@keyframes wjazd { from { transform: translateY(100%); } to { transform: none; } }
+.m-modal-tytul { font-size: 17px; font-weight: 700; color: #fff; margin-bottom: 8px; }
+.m-modal-tresc { font-size: 13px; color: #aaa49c; line-height: 1.5; margin-bottom: 14px; }
+.m-label { font-size: 11px; font-weight: 600; color: #94908a; text-transform: uppercase; letter-spacing: 0.04em; display: block; margin: 12px 0 5px; }
+.m-input { width: 100%; background: #16161a; border: 1px solid #33333a; border-radius: 9px; padding: 11px; color: #fff; font-size: 14px; outline: none; }
+.m-input:focus { border-color: #c2873f; }
+.m-textarea { resize: none; height: 64px; }
+.m-toggle { display: flex; gap: 6px; }
+.m-toggle button { flex: 1; background: #16161a; border: 1px solid #33333a; color: #94908a; padding: 10px; border-radius: 9px; font-size: 13px; cursor: pointer; }
+.m-toggle .on { background: #c2873f; color: #fff; border-color: #c2873f; font-weight: 600; }
+.m-hint-mini { font-size: 11px; color: #8a7340; margin-top: 6px; line-height: 1.4; }
+.m-modal-linki { display: flex; flex-direction: column; gap: 6px; }
+.m-dowod-pasek { font-size: 11px; font-weight: 600; padding: 7px 10px; border-radius: 8px; margin-bottom: 10px; }
+.m-dowod-brak { background: #2a1f10; color: #e8a04e; border: 1px solid #5c3f1d; }
+.m-dowod-ok { background: #161e16; color: #9fc7a2; border: 1px solid #3d5a3f; }
+.m-btn-dowod { background: #2a1f10; color: #e8c98f; border: 1px solid #5c3f1d; border-radius: 9px; padding: 11px 14px; font-size: 13px; font-weight: 700; cursor: pointer; }
+.m-btn-zrob:disabled { opacity: 0.4; cursor: not-allowed; }
+.m-dok-grupa { margin-bottom: 12px; }
+.m-dok-naglowek { font-size: 11px; font-weight: 700; color: #cbc6be; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px; }
+.m-dok-hint { text-transform: none; font-weight: 400; color: #6b6760; font-size: 10px; }
+.m-link-chip { background: #16161a; border: 1px solid #33333a; border-radius: 8px; padding: 9px 11px; font-size: 13px; color: #d99a4e; text-decoration: none; }
+.m-data-godz { display: flex; gap: 8px; }
+.m-alarm-row { display: flex; align-items: center; gap: 9px; margin-top: 12px; font-size: 13px; color: #e8c98f; cursor: pointer; }
+.m-alarm-row input { width: 18px; height: 18px; accent-color: #c2873f; }
+.stopka { font-size: 11px; color: #44403a; margin-top: 20px; text-align: center; }
+`;
+
+return WorkflyMobile;
+})();
+
+const ModKokpit = (function() {
+// ============================================================
+// WORKFLY — kokpit zarządzającego (laptop, dla roli Zarządzający zleceniem).
+// Droga B: główna „Wymaga decyzji" + sekcje w menu bocznym.
+// Sekcje: Wymaga decyzji / Decyzje XOR / Przypisania / Monitorowanie
+//   / Przepinanie / Dokumenty warunkowych / Dowody / Anulowanie.
+// Widzi TYLKO swoje zlecenia. PROTOTYP — bez zapisu.
+// Dane: proces serwisowy Loxone.
+// ============================================================
+
+const PRACOWNICY = {
+  'Serwisant': ['Michał C.', 'Adam W.'],
+  'Koordynator': ['Tomek L.'],
+  'COO': ['Justyna K.'],
+};
+
+// stan początkowy — zlecenia zarządzającego
+const ZLECENIA_START = [
+  {
+    nr: 'ZLEC-2026-014', klient: 'Kowalski / dom Sopot', priorytet: 'wysoki', start: '2026-06-02',
+    tikety: [
+      { id: 'a1', nazwa: 'Diagnoza zdalna', stanowisko: 'Serwisant', osoba: 'Michał C.', status: 'zrobione', termin: '2026-06-02', dowod: null },
+      { id: 'a2', nazwa: 'Naprawa zdalna systemu', stanowisko: 'Serwisant', osoba: 'Michał C.', status: 'zrobione', termin: '2026-06-03', dowod: true, wymagaDowodu: true },
+      { id: 'a3', nazwa: 'Zamknięcie i fakturowanie', stanowisko: 'COO', osoba: null, status: 'aktywny-nieprzypisany', termin: '2026-06-04', dowod: null },
+    ],
+    decyzjaXOR: null,
+  },
+  {
+    nr: 'ZLEC-2026-017', klient: 'Nowak / biuro Gdynia', priorytet: 'normalny', start: '2026-06-03',
+    tikety: [
+      { id: 'b1', nazwa: 'Zgłoszenie awarii', stanowisko: 'Klient', osoba: null, status: 'nt-oczekuje', termin: '2026-06-03', nt: true },
+      { id: 'b2', nazwa: 'Diagnoza zdalna i AI Triage', stanowisko: 'Serwisant', osoba: 'Adam W.', status: 'w-trakcie', termin: '2026-06-01', dowod: null },
+    ],
+    decyzjaXOR: { krok: 'Decyzja: zgoda na dostęp zdalny?', sciezki: ['zgoda — diagnoza i naprawa', 'brak zgody — wstrzymanie'] },
+  },
+];
+
+const SEKCJE = [
+  { id: 'przeglad', label: 'Przegląd', ikona: '🗺' },
+  { id: 'decyzje', label: 'Wymaga decyzji', ikona: '⚡' },
+  { id: 'xor', label: 'Decyzje XOR', ikona: '◆' },
+  { id: 'przypisania', label: 'Przypisania', ikona: '👤' },
+  { id: 'monitor', label: 'Monitorowanie', ikona: '📊' },
+  { id: 'przepiecie', label: 'Przepięcie zadań', ikona: '↹' },
+  { id: 'dowody', label: 'Dowody', ikona: '📷' },
+  { id: 'anulowanie', label: 'Anulowanie', ikona: '⊘' },
+];
+
+const DZIS = new Date('2026-06-03T18:00:00');
+function poTerminie(t) { return new Date(t) < DZIS; }
+
+function KokpitZarzadzajacego() {
+  // v6: kokpit czyta i pisze do MAGAZYNU (wspólna baza w przeglądarce).
+  // Gdy baza pusta — informacja zamiast danych przykładowych.
+  const baza = useBaza();
+  const [sekcja, setSekcja] = useState('przeglad');
+  const [anulModal, setAnulModal] = useState(null); // tiket do anulowania
+  const [anulPowod, setAnulPowod] = useState('');
+  const [przypisInput, setPrzypisInput] = useState({}); // tiketId -> tekst
+
+  const zlecenia = baza.zlecenia;
+  const tikety = baza.tikety;
+  const procesOf = z => baza.procesy.find(p => p.id === z.procesId);
+  const tkZlec = zid => tikety.filter(t => t.zlecenieId === zid);
+
+  // --- zbiory robocze ---
+  const decyzjeXorOtwarte = tikety.filter(t => t.typ === 'decyzja' && t.statusPracy !== 'zrobione');
+  const ntDoOdhaczenia = tikety.filter(t => t.typ === 'zadanie' && t.widoczny === false && t.stan === 'aktywny' && t.statusPracy !== 'zrobione');
+  const nieprzypisane = tikety.filter(t => t.typ === 'zadanie' && t.stan === 'aktywny' && !t.osoba && t.statusPracy !== 'zrobione');
+  const warunkoweDoAnulowania = tikety.filter(t => {
+    if (t.typ !== 'zadanie' || t.stan !== 'warunkowy') return false;
+    // warunkowy, którego bramka ma już decyzję (czyli ta gałąź NIE została wybrana)
+    const z = zlecenia.find(x => x.id === t.zlecenieId); const p = z && procesOf(z);
+    if (!p) return false;
+    const wejXor = p.przejscia.find(pr => pr.cel === t.krokId && pr.bramka === 'XOR');
+    if (!wejXor) return false;
+    return baza.decyzjeXor.some(d => d.zlecenieId === t.zlecenieId && d.bramkaKrokId === wejXor.zrodlo && d.wybranePrzejscieId !== wejXor.id);
+  });
+  const anulowane = tikety.filter(t => t.stan === 'anulowany');
+  const zDowodem = tikety.filter(t => t.typ === 'zadanie' && t.wymagaDowodu);
+  const liczbaDecyzji = decyzjeXorOtwarte.length + ntDoOdhaczenia.length + nieprzypisane.length;
+
+  function odhaczNT(t) { tiketUstaw(t.id, { statusPracy: 'zrobione', wykonano: new Date().toLocaleString('pl-PL') }); }
+  function przypisz(t) {
+    const os = (przypisInput[t.id] || '').trim(); if (!os) return;
+    tiketUstaw(t.id, { osoba: os }); setPrzypisInput(s => ({ ...s, [t.id]: '' }));
+  }
+  function anuluj() {
+    if (!anulModal || !anulPowod.trim()) return;
+    tiketUstaw(anulModal.id, { stan: 'anulowany', powodAnulowania: anulPowod.trim() });
+    setAnulModal(null); setAnulPowod('');
+  }
+
+  const KontekstT = ({ t }) => <span className="dz-kontekst">{t.zlecenieNr} · {t.klient || '—'} · krok {t.numer || '—'}</span>;
+
+  return (
+    <div style={styles.app}>
+      <style>{css}</style>
+      <header style={styles.header}>
+        <div><div className="logo">WORKFLY</div><div className="podtytul">Kokpit zarządzającego</div></div>
+        <div className="zakres-info">Widzisz tylko swoje zlecenia</div>
+      </header>
+
+      <div style={styles.uklad}>
+        <nav style={styles.menu}>
+          {SEKCJE.map(s => (
+            <button key={s.id} className={'menu-btn' + (sekcja === s.id ? ' menu-on' : '')} onClick={() => setSekcja(s.id)}>
+              <span className="ikona">{s.ikona}</span> {s.label}
+              {s.id === 'decyzje' && liczbaDecyzji > 0 && <span className="badge">{liczbaDecyzji}</span>}
+            </button>
+          ))}
+        </nav>
+
+        <main style={styles.tresc}>
+          {zlecenia.length === 0 && (
+            <div className="panel">
+              <h2>Brak zleceń w bazie</h2>
+              <p className="opis">Kokpit pracuje na żywych danych. Zamodeluj proces (moduł Modelowanie), opublikuj go, a następnie uruchom zlecenie (moduł Uruchomienie) — pojawi się tutaj z tiketami, decyzjami i postępem.</p>
+            </div>
+          )}
+
+          {zlecenia.length > 0 && sekcja === 'przeglad' && (
+            <div className="panel">
+              <h2>Przegląd zleceń</h2>
+              <p className="opis">Obraz sytuacji na teraz — Twoje zlecenia. Zacznij od tego, co wymaga decyzji.</p>
+              {zlecenia.map(z => {
+                const tk = tkZlec(z.id).filter(t => t.typ === 'zadanie' && t.stan !== 'anulowany');
+                const zrob = tk.filter(t => t.statusPracy === 'zrobione').length;
+                const proc = procesOf(z);
+                return (
+                  <div key={z.id} className="zlec-karta">
+                    <div className="zlec-naglowek">
+                      <b>{z.nr}</b> · {z.klient || '—'} <span className="dz-kontekst">· {proc ? proc.nazwa + ' v' + proc.wersja : 'proces?'} · {z.status === 'zakonczone' ? '✓ zakończone' : 'w toku'}</span>
+                    </div>
+                    <div className="zlec-postep">
+                      <div className="pasek"><div className="pasek-fill" style={{ width: (tk.length ? Math.round(100 * zrob / tk.length) : 0) + '%' }} /></div>
+                      <span className="dz-kontekst">{zrob}/{tk.length} tiketów zrobionych</span>
+                    </div>
+                    <div className="zlec-tikety">
+                      {tk.map(t => (
+                        <span key={t.id} className={'tk-chip tk-' + (t.statusPracy === 'zrobione' ? 'zrob' : t.stan)} title={t.nazwa + (t.widoczny === false ? ' (NT)' : '')}>
+                          {t.numer} {t.widoczny === false ? '◌' : ''}{t.statusPracy === 'zrobione' ? '✓' : ''}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {zlecenia.length > 0 && sekcja === 'decyzje' && (
+            <div className="panel">
+              <h2>Wymaga decyzji {liczbaDecyzji > 0 && <span className="badge badge-duzy">{liczbaDecyzji}</span>}</h2>
+              <p className="opis">Wszystko, co czeka na Ciebie: decyzje XOR, zdarzenia zewnętrzne (NT) do odhaczenia, tikety bez przypisanej osoby.</p>
+              {liczbaDecyzji === 0 && <div className="dz-kontekst">Nic nie czeka — proces płynie. ✓</div>}
+              {decyzjeXorOtwarte.map(t => (
+                <div key={t.id} className="dz-karta dz-xor">
+                  <span className="dz-typ">◆ DECYZJA XOR</span>
+                  <div className="dz-tytul">{t.nazwa}</div>
+                  <KontekstT t={t} />
+                  <div className="dz-sciezki">
+                    {(t.galezie || []).map(g => (
+                      <button key={g.przejscieId} className="dz-sciezka" onClick={() => decyzjaXorPodejmij(t.zlecenieId, t.krokId, g.przejscieId)}>→ „{g.etykieta}"</button>
+                    ))}
+                  </div>
+                </div>
+              ))}
+              {ntDoOdhaczenia.map(t => (
+                <div key={t.id} className="dz-karta dz-nt">
+                  <span className="dz-typ">◌ ZDARZENIE ZEWNĘTRZNE (NT)</span>
+                  <div className="dz-tytul">{t.nazwa}</div>
+                  <KontekstT t={t} />
+                  <button className="dz-btn-odhacz" onClick={() => odhaczNT(t)}>✓ Odhacz — zdarzenie nastąpiło</button>
+                </div>
+              ))}
+              {nieprzypisane.map(t => (
+                <div key={t.id} className="dz-karta">
+                  <span className="dz-typ">👤 WYMAGA PRZYPISANIA</span>
+                  <div className="dz-tytul">{t.nazwa} <span className="dz-kontekst">({t.stanowisko})</span></div>
+                  <KontekstT t={t} />
+                  <div className="dz-przypisz">
+                    <input className="dz-input" placeholder="imię i nazwisko" value={przypisInput[t.id] || ''} onChange={e => setPrzypisInput(s => ({ ...s, [t.id]: e.target.value }))} />
+                    <button className="dz-btn-odhacz" onClick={() => przypisz(t)}>Przypisz</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {zlecenia.length > 0 && sekcja === 'xor' && (
+            <div className="panel">
+              <h2>Decyzje XOR — historia</h2>
+              <p className="opis">Podjęte wybory ścieżek (kto, kiedy — w realnej aplikacji z kontem; tu znacznik czasu).</p>
+              {baza.decyzjeXor.length === 0 && <div className="dz-kontekst">Brak podjętych decyzji.</div>}
+              {baza.decyzjeXor.map((d, i) => {
+                const z = zlecenia.find(x => x.id === d.zlecenieId);
+                const p = z && procesOf(z);
+                const br = p && p.kroki.find(k => k.id === d.bramkaKrokId);
+                const prz = p && p.przejscia.find(x => x.id === d.wybranePrzejscieId);
+                return <div key={i} className="anul-wiersz"><b>{z ? z.nr : '?'}</b> · {br ? br.nazwa : 'bramka'} → „{prz ? prz.etykieta : '?'}" <span className="dz-kontekst">{new Date(d.kiedy).toLocaleString('pl-PL')}</span></div>;
+              })}
+            </div>
+          )}
+
+          {zlecenia.length > 0 && sekcja === 'przypisania' && (
+            <div className="panel">
+              <h2>Przypisania</h2>
+              <p className="opis">Aktywne tikety i ich wykonawcy. Nieprzypisane znajdziesz też w „Wymaga decyzji".</p>
+              {tikety.filter(t => t.typ === 'zadanie' && t.stan === 'aktywny').map(t => (
+                <div key={t.id} className="anul-wiersz">{t.numer} · {t.nazwa} <span className="dz-kontekst">({t.stanowisko})</span> — <b>{t.osoba || 'NIEPRZYPISANY'}</b></div>
+              ))}
+            </div>
+          )}
+
+          {zlecenia.length > 0 && sekcja === 'monitor' && (
+            <div className="panel">
+              <h2>Monitorowanie</h2>
+              <p className="opis">Stan wszystkich tiketów (makieta nie liczy jeszcze terminów baseline — kolumna terminu pojawi się z silnikiem dat).</p>
+              {tikety.filter(t => t.typ === 'zadanie').map(t => (
+                <div key={t.id} className="anul-wiersz">
+                  <b>{t.zlecenieNr}</b> / {t.numer} · {t.nazwa}{t.widoczny === false ? ' ◌NT' : ''} — <span className="dz-kontekst">{t.stan === 'anulowany' ? '⊘ anulowany' : t.statusPracy === 'zrobione' ? '✓ zrobione' : t.stan}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {zlecenia.length > 0 && sekcja === 'przepiecie' && (
+            <div className="panel">
+              <h2>Przepięcie zadań</h2>
+              <p className="opis">Zmiana wykonawcy tiketu (np. po odejściu pracownika): wpisz nową osobę przy tikecie w sekcji „Przypisania" — pole edycji dostępne dla nieprzypisanych w „Wymaga decyzji"; pełne masowe przepinanie po osobie — funkcja produktu (Wariant B).</p>
+            </div>
+          )}
+
+          {zlecenia.length > 0 && sekcja === 'dowody' && (
+            <div className="panel">
+              <h2>Dowody wykonania</h2>
+              <p className="opis">Tikety wymagające zdjęcia-dowodu i ich status.</p>
+              {zDowodem.length === 0 && <div className="dz-kontekst">Żaden tiket nie wymaga dowodu.</div>}
+              {zDowodem.map(t => (
+                <div key={t.id} className="anul-wiersz">
+                  📷 {t.zlecenieNr} / {t.numer} · {t.nazwa} — <b>{t.dowodDolaczony ? '✓ dowód dołączony' : 'oczekuje na dowód'}</b>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {zlecenia.length > 0 && sekcja === 'anulowanie' && (
+            <div className="panel">
+              <h2>Anulowanie</h2>
+              <p className="opis">Tikety niewybranych ścieżek XOR — system nigdy nie wygasza ich sam; anulowanie zawsze ręczne, z powodem.</p>
+              {warunkoweDoAnulowania.length === 0 && <div className="dz-kontekst">Nic do anulowania.</div>}
+              {warunkoweDoAnulowania.map(t => (
+                <div key={t.id} className="anul-wiersz">
+                  {t.zlecenieNr} / {t.numer} · {t.nazwa} <span className="dz-kontekst">(ścieżka niewybrana)</span>
+                  <button className="anul-btn" onClick={() => setAnulModal(t)}>⊘ Anuluj</button>
+                </div>
+              ))}
+              {anulowane.length > 0 && <><h2 style={{ marginTop: 20 }}>Anulowane</h2>
+                {anulowane.map(t => <div key={t.id} className="anul-wiersz anul-zrobiony">{t.zlecenieNr} / {t.numer} · {t.nazwa} <span className="dz-kontekst">powód: {t.powodAnulowania}</span></div>)}</>}
+            </div>
+          )}
+        </main>
+      </div>
+
+      {anulModal && (
+        <div className="modal-tlo" onClick={() => setAnulModal(null)}>
+          <div className="modal" onClick={e => e.stopPropagation()}>
+            <div className="modal-tytul">Anulować tiket „{anulModal.nazwa}"?</div>
+            <div className="modal-tresc">Podaj powód — zostanie zapisany jako ślad decyzji.</div>
+            <input className="dz-input" autoFocus placeholder="powód anulowania" value={anulPowod} onChange={e => setAnulPowod(e.target.value)} />
+            <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+              <button className="anul-btn" disabled={!anulPowod.trim()} onClick={anuluj}>⊘ Anuluj tiket</button>
+              <button className="dz-btn-odhacz" onClick={() => setAnulModal(null)}>Wróć</button>
+            </div>
+          </div>
+        </div>
+      )}
+      <Stopka />
+    </div>
+  );
+}
+
+function Stopka() { return <div className="stopka">WORKFLY · od procesu do efektów · ZMIANOLOGICA · Dr Marcin Żółtak</div>; }
+
+const styles = {
+  app: { minHeight: '100vh', background: '#16161a', color: '#e2e0db', fontFamily: "'Montserrat', system-ui, sans-serif" },
+  header: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '16px 24px', borderBottom: '1px solid #33333a' },
+  uklad: { display: 'flex', minHeight: 'calc(100vh - 120px)' },
+  menu: { width: 220, padding: '14px 10px', borderRight: '1px solid #26262c', display: 'flex', flexDirection: 'column', gap: 4 },
+  tresc: { flex: 1, padding: '18px 22px', maxWidth: 980 },
+};
+
+const css = `
+/* --- v6: klasy widoku magazynowego --- */
+.menu-btn { display:flex; align-items:center; gap:8px; width:100%; text-align:left; background:transparent; border:1px solid transparent; color:#94908a; border-radius:8px; padding:9px 11px; font-size:13px; cursor:pointer; }
+.menu-btn:hover { color:#cbc6be; }
+.menu-on { background:#2a1f10 !important; color:#e8c98f !important; border-color:#5c3f1d !important; }
+.badge { background:#7a2d2d; color:#ffd9d9; border-radius:10px; padding:1px 7px; font-size:11px; margin-left:auto; }
+.badge-duzy { font-size:13px; margin-left:8px; }
+.panel { background:#1b1b20; border:1px solid #33333a; border-radius:14px; padding:20px 22px; margin-bottom:16px; }
+.panel h2 { margin:0 0 6px; font-size:17px; color:#fff; display:flex; align-items:center; }
+.zlec-karta { border:1px solid #33333a; border-radius:11px; padding:12px 14px; margin-top:10px; }
+.zlec-naglowek { font-size:14px; color:#e8c98f; margin-bottom:8px; }
+.zlec-postep { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+.pasek { flex:1; height:8px; background:#26262c; border-radius:6px; overflow:hidden; }
+.pasek-fill { height:100%; background:linear-gradient(90deg,#d99a4e,#9fc7a2); }
+.zlec-tikety { display:flex; gap:5px; flex-wrap:wrap; }
+.tk-chip { font-size:10px; padding:3px 7px; border-radius:7px; border:1px solid #33333a; color:#94908a; }
+.tk-aktywny { border-color:#5c3f1d; color:#e8c98f; }
+.tk-zrob { border-color:#3d5a3f; color:#9fc7a2; }
+.tk-warunkowy { border-style:dashed; }
+.tk-anulowany { opacity:0.4; text-decoration:line-through; }
+.dz-input { background:#101014; border:1px solid #33333a; color:#e6e2da; border-radius:8px; padding:8px 10px; font-size:13px; }
+.modal-tlo { position:fixed; inset:0; background:#000a; display:flex; align-items:center; justify-content:center; z-index:50; }
+.modal { background:#1b1b20; border:1px solid #5c3f1d; border-radius:14px; padding:20px; max-width:420px; width:92%; }
+.modal-tytul { font-size:15px; font-weight:700; color:#fff; margin-bottom:6px; }
+.stopka { text-align:center; font-size:10px; color:#44403a; padding:18px 0 26px; }
+
+@import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800&display=swap');
+* { font-family: 'Montserrat', system-ui, sans-serif; box-sizing: border-box; }
+.logo { font-size: 19px; font-weight: 800; letter-spacing: 0.04em; background: linear-gradient(90deg,#d99a4e,#c2873f); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.podtytul { font-size: 13px; color: #94908a; margin-left: 12px; }
+.zakres-info { font-size: 11px; color: #6b6760; font-style: italic; }
+.menu { width: 230px; border-right: 1px solid #33333a; padding: 16px 10px; display: flex; flex-direction: column; gap: 4px; flex-shrink: 0; }
+.menu-item { display: flex; align-items: center; gap: 10px; background: transparent; border: none; color: #94908a; padding: 11px 12px; border-radius: 9px; cursor: pointer; font-size: 13px; text-align: left; width: 100%; }
+.menu-item:hover { background: #1f1f24; color: #cbc6be; }
+.menu-aktywny { background: #2a1f10 !important; color: #e8c98f !important; }
+.menu-ikona { font-size: 14px; width: 18px; text-align: center; }
+.menu-label { flex: 1; }
+.menu-badge { background: #c2873f; color: #fff; font-size: 10px; font-weight: 700; min-width: 18px; height: 18px; border-radius: 9px; display: flex; align-items: center; justify-content: center; padding: 0 5px; }
+.tresc { flex: 1; padding: 26px 30px; max-width: 860px; }
+h2 { font-size: 21px; font-weight: 700; color: #fff; margin: 0 0 6px; display: flex; align-items: center; gap: 12px; }
+.licznik-duzy { background: #c2873f; color: #fff; font-size: 14px; font-weight: 800; min-width: 28px; height: 28px; border-radius: 14px; display: inline-flex; align-items: center; justify-content: center; padding: 0 8px; }
+.opis { font-size: 13px; color: #94908a; line-height: 1.5; margin: 0 0 22px; }
+.pusto-ok { text-align: center; color: #6b9b6e; padding: 50px; font-size: 15px; background: #161e16; border: 1px solid #2d3a2d; border-radius: 12px; }
+.dz-karta { background: #1f1f24; border: 1px solid #33333a; border-left: 4px solid #44444d; border-radius: 11px; padding: 16px 18px; margin-bottom: 12px; }
+.dz-xor { border-left-color: #c2873f; }
+.dz-przypisz { border-left-color: #d99a4e; }
+.dz-nt { border-left-color: #8fb3d9; }
+.dz-opoznienie { border-left-color: #e06b6b; background: #241818; }
+.dz-typ { font-size: 11px; font-weight: 700; color: #94908a; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 8px; }
+.dz-typ-alarm { color: #e06b6b; }
+.dz-tytul { font-size: 16px; font-weight: 700; color: #fff; margin-bottom: 4px; }
+.dz-kontekst { font-size: 12px; color: #94908a; margin-bottom: 12px; }
+.dz-sciezki { display: flex; gap: 8px; flex-wrap: wrap; }
+.dz-sciezka { background: #2a1f10; color: #e8c98f; border: 1px solid #5c3f1d; border-radius: 9px; padding: 10px 16px; font-size: 13px; font-weight: 600; cursor: pointer; }
+.dz-sciezka:hover { background: #3a2a14; }
+.dz-select { background: #16161a; border: 1px solid #33333a; border-radius: 9px; padding: 10px 12px; color: #fff; font-size: 13px; min-width: 220px; outline: none; }
+.dz-select:focus { border-color: #c2873f; }
+.dz-btn-odhacz { background: #1a2230; color: #8fb3d9; border: 1px solid #2d4a6b; border-radius: 9px; padding: 10px 16px; font-size: 13px; font-weight: 600; cursor: pointer; }
+.dz-btn-odhacz:hover { background: #22304a; }
+.opoz-wiersz { display: flex; justify-content: space-between; font-size: 13px; color: #e2e0db; padding: 7px 0; border-top: 1px solid #3a2a2a; }
+.opoz-termin { color: #e06b6b; font-size: 12px; }
+.pg-pali { display: flex; align-items: center; gap: 18px; border-radius: 12px; padding: 18px 22px; margin-bottom: 16px; }
+.pg-pali-alarm { background: #241818; border: 1px solid #5a2a2a; }
+.pg-pali-ok { background: #161e16; border: 1px solid #2d3a2d; }
+.pg-pali-licz { font-size: 44px; font-weight: 800; color: #e06b6b; min-width: 56px; text-align: center; }
+.pg-pali-ok .pg-pali-licz { color: #6b9b6e; }
+.pg-pali-tyt { font-size: 14px; font-weight: 700; color: #fff; margin-bottom: 6px; }
+.pg-pali-item { font-size: 12px; color: #aaa49c; padding: 2px 0; }
+.pg-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.pg-karta { background: #1f1f24; border: 1px solid #33333a; border-radius: 12px; padding: 18px; }
+.pg-tyt { font-size: 13px; font-weight: 700; color: #fff; margin-bottom: 16px; }
+.pg-tyt-sub { font-size: 11px; font-weight: 400; color: #6b6760; }
+.pg-slupki { display: flex; gap: 16px; align-items: flex-end; height: 130px; padding: 0 10px; }
+.pg-sl { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; }
+.pg-sl-bar { width: 100%; max-width: 50px; border-radius: 6px 6px 0 0; min-height: 6px; transition: height 0.3s; }
+.pg-sl-num { font-size: 18px; font-weight: 800; color: #fff; margin-top: 8px; }
+.pg-sl-lbl { font-size: 10px; color: #94908a; margin-top: 2px; text-align: center; }
+.pg-obc { display: flex; flex-direction: column; gap: 10px; }
+.pg-obc-row { display: flex; align-items: center; gap: 10px; }
+.pg-obc-osoba { font-size: 12px; color: #cbc6be; width: 80px; flex-shrink: 0; }
+.pg-obc-track { flex: 1; height: 14px; background: #2a2a30; border-radius: 7px; overflow: hidden; }
+.pg-obc-fill { height: 100%; background: linear-gradient(90deg,#c2873f,#d99a4e); border-radius: 7px; min-width: 2px; transition: width 0.3s; }
+.pg-obc-num { font-size: 13px; font-weight: 700; color: #e8c98f; width: 20px; text-align: right; }
+.pg-post { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+.pg-post-nr { font-family: monospace; font-size: 12px; color: #c2873f; width: 120px; flex-shrink: 0; }
+.pg-post-track { flex: 1; height: 10px; background: #2a2a30; border-radius: 5px; overflow: hidden; }
+.pg-post-fill { height: 100%; background: linear-gradient(90deg,#6b9b6e,#8fc792); border-radius: 5px; transition: width 0.3s; }
+.pg-post-proc { font-size: 12px; font-weight: 700; color: #9fc7a2; width: 36px; text-align: right; }
+.pg-most { display: flex; justify-content: space-between; align-items: center; background: #2a1f10; border: 1px solid #5c3f1d; border-radius: 12px; padding: 18px 22px; margin-top: 18px; cursor: pointer; transition: background 0.15s; }
+.pg-most:hover { background: #3a2a14; }
+.pg-most-licz { font-size: 30px; font-weight: 800; color: #e8c98f; }
+.pg-most-txt { font-size: 13px; color: #aaa49c; }
+.pg-most-btn { background: #c2873f; color: #fff; border: none; border-radius: 9px; padding: 12px 18px; font-size: 14px; font-weight: 700; cursor: pointer; }
+.placeholder { color: #6b6760; padding: 50px; text-align: center; border: 1px dashed #33333a; border-radius: 12px; font-size: 14px; }
+.mon-karta { background: #1f1f24; border: 1px solid #33333a; border-radius: 11px; padding: 16px 18px; margin-bottom: 12px; }
+.mon-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+.mon-nr { font-family: monospace; font-size: 13px; color: #c2873f; font-weight: 700; }
+.mon-klient { font-size: 14px; color: #fff; margin-left: 8px; }
+.mon-prio { font-size: 10px; font-weight: 700; padding: 3px 9px; border-radius: 6px; text-transform: uppercase; }
+.prio-wysoki { background: #3a2014; color: #e8a04e; }
+.prio-normalny { background: #2a2a30; color: #94908a; }
+.prio-krytyczny { background: #4a1f1f; color: #f0a0a0; }
+.mon-pasek { height: 7px; background: #33333a; border-radius: 4px; overflow: hidden; margin-bottom: 8px; }
+.mon-fill { height: 100%; background: linear-gradient(90deg,#6b9b6e,#8fc792); border-radius: 4px; transition: width 0.3s; }
+.mon-meta { display: flex; justify-content: space-between; font-size: 12px; color: #94908a; margin-bottom: 10px; }
+.mon-opoz { color: #e06b6b; font-weight: 600; }
+.mon-tikety { display: flex; flex-wrap: wrap; gap: 6px; }
+.mon-tik { font-size: 11px; padding: 4px 9px; border-radius: 6px; }
+.mon-done { background: #1c241c; color: #9fc7a2; }
+.mon-late { background: #2a1818; color: #e06b6b; }
+.mon-open { background: #2a2a30; color: #cbc6be; }
+.prz-lbl { font-size: 12px; font-weight: 600; color: #94908a; display: block; margin-bottom: 6px; }
+.prz-info { font-size: 11px; color: #6b6760; margin-top: 14px; font-style: italic; line-height: 1.4; }
+.dow-miniatura { background: #16161a; border: 1px solid #33333a; border-radius: 9px; padding: 14px; font-size: 12px; color: #94908a; margin-top: 6px; }
+.anul-wiersz { display: flex; justify-content: space-between; align-items: center; }
+.anul-btn { background: transparent; color: #e06b6b; border: 1px solid #5a2a2a; border-radius: 9px; padding: 9px 16px; font-size: 13px; font-weight: 600; cursor: pointer; }
+.anul-btn:hover { background: #2a1818; }
+.anul-btn:disabled { opacity: 0.4; }
+.anul-zrobiony { opacity: 0.6; }
+.dz-sciezka:disabled { opacity: 0.4; cursor: not-allowed; }
+.modal-tlo { position: fixed; inset: 0; background: rgba(0,0,0,0.65); display: flex; align-items: center; justify-content: center; z-index: 50; }
+.modal { background: #1f1f24; border: 1px solid #33333a; border-radius: 14px; padding: 24px; width: 92%; max-width: 460px; }
+.modal-tytul { font-size: 17px; font-weight: 700; color: #fff; margin-bottom: 8px; }
+.modal-tresc { font-size: 13px; color: #aaa49c; line-height: 1.5; margin-bottom: 14px; }
+.modal-input { width: 100%; background: #16161a; border: 1px solid #33333a; border-radius: 9px; padding: 11px; color: #fff; font-size: 14px; outline: none; resize: none; height: 70px; margin-bottom: 12px; }
+.modal-input:focus { border-color: #c2873f; }
+.modal-btn { width: 100%; }
+.modal-btn-szary { width: 100%; background: #2a2a30; color: #94908a; border: none; border-radius: 9px; padding: 11px; font-size: 14px; cursor: pointer; margin-top: 8px; }
+.stopka { text-align: center; font-size: 11px; color: #44403a; padding: 16px; border-top: 1px solid #33333a; }
+`;
+
+return KokpitZarzadzajacego;
+})();
+
+
+// ===== POWŁOKA =====
+// ============================================================
+// WORKFLY v4 — zintegrowana powłoka (Wariant A)
+// Logowanie z wyborem roli → menu zależne od roli → moduł.
+// Moduły są niezależne (izolowane w IIFE), powłoka przełącza widok.
+// PROTOTYP: dane nie przepływają między modułami (brak backendu).
+//   Prawdziwa integracja = WORKFLY_integracja_backend.md (Wariant B).
+// ============================================================
+
+// definicja ról i tego, co każda widzi
+const ROLE = {
+  modelujacy:     { nazwa: 'Modelujący',              ikona: '✎', moduly: ['modelowanie'] },
+  uruchamiajacy:  { nazwa: 'Uruchamiający',           ikona: '▶', moduly: ['uruchomienie'] },
+  zarzadzajacy:   { nazwa: 'Zarządzający zleceniem',   ikona: '◆', moduly: ['kokpit'] },
+  pracownik:      { nazwa: 'Pracownik',               ikona: '☑', moduly: ['tikety'] },
+  dyrektor:       { nazwa: 'Zarządzający (pełny)',    ikona: '★', moduly: ['modelowanie','uruchomienie','kokpit','tikety'] },
+};
+
+const MODULY = {
+  modelowanie:  { nazwa: 'Modelowanie procesów', ikona: '✎', komponent: ModModelowanie,   urzadzenie: 'laptop' },
+  uruchomienie: { nazwa: 'Uruchomienie zlecenia', ikona: '▶', komponent: ModUruchomienie, urzadzenie: 'laptop' },
+  kokpit:       { nazwa: 'Kokpit zarządzającego', ikona: '◆', komponent: ModKokpit,        urzadzenie: 'laptop' },
+  tikety:       { nazwa: 'Moje zadania',          ikona: '☑', komponent: ModTikety,        urzadzenie: 'telefon + laptop' },
+};
+
+function WorkflyV4() {
+  const [rola, setRola] = useState(null);          // wybrana rola (null = ekran logowania)
+  const [aktywnyModul, setAktywnyModul] = useState(null);
+
+  // logowanie
+  if (!rola) {
+    return (
+      <div className="v4-login">
+        <style>{powlokaCss}</style>
+        <div className="v4-login-box">
+          <div className="v4-logo">WORKFLY</div>
+          <div className="v4-haslo">od procesu do efektów</div>
+          <div className="v4-login-tyt">Zaloguj się jako…</div>
+          <div className="v4-login-podp">W prawdziwej aplikacji logujesz się hasłem, a system zna Twoje role. Tu wybierasz rolę, by zobaczyć, co dana osoba widzi.</div>
+          <div className="v4-role">
+            {Object.entries(ROLE).map(([id, r]) => (
+              <button key={id} className="v4-rola" onClick={() => { setRola(id); setAktywnyModul(ROLE[id].moduly[0]); }}>
+                <span className="v4-rola-ikona">{r.ikona}</span>
+                <span className="v4-rola-nazwa">{r.nazwa}</span>
+                <span className="v4-rola-mod">{r.moduly.length === 1 ? MODULY[r.moduly[0]].nazwa : `dostęp do wszystkiego (${r.moduly.length} moduły)`}</span>
+              </button>
+            ))}
+          </div>
+          <div className="v4-login-stopka">ZMIANOLOGICA · Dr Marcin Żółtak</div>
+        </div>
+      </div>
+    );
+  }
+
+  const dostepneModuly = ROLE[rola].moduly;
+  const Komponent = MODULY[aktywnyModul].komponent;
+
+  return (
+    <div className="v4-app">
+      <style>{powlokaCss}</style>
+      {/* górny pasek powłoki */}
+      <div className="v4-pasek">
+        <div className="v4-pasek-lewo">
+          <span className="v4-pasek-logo">WORKFLY</span>
+          {dostepneModuly.length > 1 && (
+            <div className="v4-przelacznik">
+              {dostepneModuly.map(m => (
+                <button key={m} className={"v4-mod-btn" + (aktywnyModul === m ? " v4-mod-on" : "")} onClick={() => setAktywnyModul(m)}>
+                  <span>{MODULY[m].ikona}</span> {MODULY[m].nazwa}
+                </button>
+              ))}
+            </div>
+          )}
+          {dostepneModuly.length === 1 && <span className="v4-pasek-modul">{MODULY[aktywnyModul].ikona} {MODULY[aktywnyModul].nazwa}</span>}
+        </div>
+        <div className="v4-pasek-prawo">
+          <span className="v4-rola-tag">{ROLE[rola].ikona} {ROLE[rola].nazwa}</span>
+          <span className="v4-urzadzenie">{MODULY[aktywnyModul].urzadzenie}</span>
+          <button className="v4-wyloguj" onClick={() => { setRola(null); setAktywnyModul(null); }}>Wyloguj</button>
+        </div>
+      </div>
+      {/* moduł */}
+      <div className="v4-modul-kontener">
+        <Komponent />
+      </div>
+    </div>
+  );
+}
+
+const powlokaCss = `
+@import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800&display=swap');
+.v4-login, .v4-app { font-family: 'Montserrat', system-ui, sans-serif; }
+.v4-login *, .v4-app * { font-family: 'Montserrat', system-ui, sans-serif; }
+.v4-login { min-height: 100vh; background: radial-gradient(circle at 50% 30%, #1f1f28, #0d0d10); display: flex; align-items: center; justify-content: center; padding: 20px; }
+.v4-login-box { background: #16161a; border: 1px solid #33333a; border-radius: 18px; padding: 40px; max-width: 460px; width: 100%; text-align: center; }
+.v4-logo { font-size: 32px; font-weight: 800; letter-spacing: 0.05em; background: linear-gradient(90deg,#d99a4e,#c2873f); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.v4-haslo { font-size: 13px; color: #94908a; margin-bottom: 28px; letter-spacing: 0.08em; }
+.v4-login-tyt { font-size: 17px; font-weight: 700; color: #fff; margin-bottom: 6px; }
+.v4-login-podp { font-size: 12px; color: #94908a; line-height: 1.5; margin-bottom: 22px; }
+.v4-role { display: flex; flex-direction: column; gap: 8px; }
+.v4-rola { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; background: #1f1f24; border: 1px solid #33333a; border-radius: 11px; padding: 13px 16px; cursor: pointer; transition: all 0.15s; text-align: left; }
+.v4-rola:hover { border-color: #c2873f; background: #2a1f10; }
+.v4-rola-ikona { display: none; }
+.v4-rola-nazwa { font-size: 14px; font-weight: 700; color: #e8c98f; }
+.v4-rola-mod { font-size: 11px; color: #94908a; }
+.v4-login-stopka { font-size: 11px; color: #44403a; margin-top: 26px; }
+.v4-app { min-height: 100vh; background: #16161a; }
+.v4-pasek { display: flex; justify-content: space-between; align-items: center; background: #0d0d10; border-bottom: 1px solid #33333a; padding: 10px 18px; flex-wrap: wrap; gap: 10px; }
+.v4-pasek-lewo { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.v4-pasek-logo { font-size: 16px; font-weight: 800; letter-spacing: 0.04em; background: linear-gradient(90deg,#d99a4e,#c2873f); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.v4-przelacznik { display: flex; gap: 4px; flex-wrap: wrap; }
+.v4-mod-btn { background: transparent; border: 1px solid #33333a; color: #94908a; border-radius: 8px; padding: 6px 11px; font-size: 12px; cursor: pointer; }
+.v4-mod-btn:hover { color: #cbc6be; }
+.v4-mod-on { background: #2a1f10 !important; color: #e8c98f !important; border-color: #5c3f1d !important; }
+.v4-pasek-modul { font-size: 13px; color: #cbc6be; }
+.v4-pasek-prawo { display: flex; align-items: center; gap: 12px; }
+.v4-rola-tag { font-size: 12px; color: #e8c98f; background: #2a1f10; border: 1px solid #5c3f1d; border-radius: 20px; padding: 4px 12px; }
+.v4-urzadzenie { font-size: 10px; color: #6b6760; font-style: italic; }
+.v4-wyloguj { background: transparent; border: 1px solid #33333a; color: #94908a; border-radius: 8px; padding: 6px 12px; font-size: 12px; cursor: pointer; }
+.v4-wyloguj:hover { color: #e06b6b; border-color: #5a2a2a; }
+.v4-modul-kontener { position: relative; }
+`;
+
+
+ReactDOM.createRoot(document.getElementById('root')).render(<WorkflyV4 />);
+</script>
+</body>
+</html>
